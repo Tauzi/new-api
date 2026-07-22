@@ -27,6 +27,7 @@ import (
 type ModelRequest struct {
 	Model string `json:"model"`
 	Group string `json:"group,omitempty"`
+	Async bool   `json:"async,omitempty"`
 }
 
 func Distribute() func(c *gin.Context) {
@@ -196,6 +197,23 @@ func getModelFromRequest(c *gin.Context) (*ModelRequest, error) {
 		}
 		return modelRequest, nil
 	}
+	if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+		form, err := common.ParseMultipartFormReusable(c)
+		if err != nil {
+			return nil, errors.New(i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+		}
+		request := &ModelRequest{
+			Model: firstFormValue(form.Value, "model"),
+			Group: firstFormValue(form.Value, "group"),
+		}
+		if value := strings.TrimSpace(firstFormValue(form.Value, "async")); value != "" && strings.HasPrefix(c.Request.URL.Path, "/v1/images/") {
+			request.Async, err = strconv.ParseBool(value)
+			if err != nil {
+				return nil, fmt.Errorf("field async must be a boolean")
+			}
+		}
+		return request, nil
+	}
 
 	var modelRequest ModelRequest
 	err := common.UnmarshalBodyReusable(c, &modelRequest)
@@ -203,6 +221,14 @@ func getModelFromRequest(c *gin.Context) (*ModelRequest, error) {
 		return nil, errors.New(i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 	}
 	return &modelRequest, nil
+}
+
+func firstFormValue(values map[string][]string, key string) string {
+	items := values[key]
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0]
 }
 
 func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
@@ -218,7 +244,7 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 		return nil, errors.New("invalid JSON request body")
 	}
 
-	values := gjson.GetManyBytes(requestBody, "model", "group")
+	values := gjson.GetManyBytes(requestBody, "model", "group", "async")
 	model, err := getJSONStringValue(values[0], "model")
 	if err != nil {
 		return nil, err
@@ -226,6 +252,13 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	group, err := getJSONStringValue(values[1], "group")
 	if err != nil {
 		return nil, err
+	}
+	async := false
+	if values[2].Exists() && strings.HasPrefix(c.Request.URL.Path, "/v1/images/") {
+		if values[2].Type != gjson.True && values[2].Type != gjson.False {
+			return nil, fmt.Errorf("field async must be a boolean")
+		}
+		async = values[2].Bool()
 	}
 
 	if _, seekErr := storage.Seek(0, io.SeekStart); seekErr != nil {
@@ -236,6 +269,7 @@ func getModelFromJSONBody(c *gin.Context) (*ModelRequest, error) {
 	return &ModelRequest{
 		Model: model,
 		Group: group,
+		Async: async,
 	}, nil
 }
 
@@ -292,6 +326,17 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 		c.Set("platform", string(constant.TaskPlatformSuno))
 		c.Set("relay_mode", relayMode)
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations/") ||
+		strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits/") {
+		// Async image task fetches are authorized against the task owner and must
+		// not select a new upstream channel.
+		shouldSelectChannel = false
+		modelRequest.Model = getTaskOriginModelName(c)
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits/") {
+			c.Set("relay_mode", relayconstant.RelayModeImageEditsFetchByID)
+		} else {
+			c.Set("relay_mode", relayconstant.RelayModeImageGenerationsFetchByID)
+		}
 	} else if strings.Contains(c.Request.URL.Path, "/v1/videos/") && strings.HasSuffix(c.Request.URL.Path, "/remix") {
 		relayMode := relayconstant.RelayModeVideoSubmit
 		c.Set("relay_mode", relayMode)
@@ -365,7 +410,17 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations") {
+		contentType := c.ContentType()
+		if slices.Contains([]string{gin.MIMEPOSTForm, gin.MIMEMultipartPOSTForm}, contentType) {
+			req, err := getModelFromRequest(c)
+			if err == nil && req.Model != "" {
+				modelRequest = *req
+			}
+		}
 		modelRequest.Model = common.GetStringIfEmpty(modelRequest.Model, "dall-e")
+		if c.Request.Method == http.MethodPost && modelRequest.Async {
+			c.Set("platform", string(constant.TaskPlatformAsyncImage))
+		}
 	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits") {
 		//modelRequest.Model = common.GetStringIfEmpty(c.PostForm("model"), "gpt-image-1")
 		contentType := c.ContentType()
@@ -374,6 +429,9 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			if err == nil && req.Model != "" {
 				modelRequest.Model = req.Model
 			}
+		}
+		if c.Request.Method == http.MethodPost && modelRequest.Async {
+			c.Set("platform", string(constant.TaskPlatformAsyncImage))
 		}
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/audio") {

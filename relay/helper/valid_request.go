@@ -181,6 +181,13 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 			}
 			imageRequest.Quality = formData.Get("quality")
 			imageRequest.Size = formData.Get("size")
+			if asyncValue := strings.TrimSpace(formData.Get("async")); asyncValue != "" {
+				async, err := strconv.ParseBool(asyncValue)
+				if err != nil {
+					return nil, fmt.Errorf("invalid async value: %w", err)
+				}
+				imageRequest.Async = common.GetPointer(async)
+			}
 			if streamValue := strings.TrimSpace(formData.Get("stream")); streamValue != "" {
 				stream, err := strconv.ParseBool(streamValue)
 				if err != nil {
@@ -259,6 +266,10 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 		if imageRequest.N == nil || *imageRequest.N == 0 {
 			imageRequest.N = common.GetPointer(uint(1))
 		}
+	}
+
+	if strings.EqualFold(strings.TrimSpace(c.Query("async")), "true") {
+		imageRequest.Async = common.GetPointer(true)
 	}
 
 	return imageRequest, nil

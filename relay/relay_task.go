@@ -288,9 +288,11 @@ func noteTaskQuotaClamp(info *relaycommon.RelayInfo, clamp *common.QuotaClamp) {
 }
 
 var fetchRespBuilders = map[int]func(c *gin.Context) (respBody []byte, taskResp *dto.TaskError){
-	relayconstant.RelayModeSunoFetchByID:  sunoFetchByIDRespBodyBuilder,
-	relayconstant.RelayModeSunoFetch:      sunoFetchRespBodyBuilder,
-	relayconstant.RelayModeVideoFetchByID: videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetchByID:             sunoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetch:                 sunoFetchRespBodyBuilder,
+	relayconstant.RelayModeVideoFetchByID:            videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeImageGenerationsFetchByID: imageFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeImageEditsFetchByID:       imageFetchByIDRespBodyBuilder,
 }
 
 func RelayTaskFetch(c *gin.Context, relayMode int) (taskResp *dto.TaskError) {
@@ -422,6 +424,100 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		taskResp = service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
 	}
 	return
+}
+
+func imageFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dto.TaskError) {
+	taskID := c.Param("task_id")
+	userID := c.GetInt("id")
+	originTask, exists, err := model.GetByTaskId(userID, taskID)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
+	}
+	if !exists || originTask == nil {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits/") && originTask.Action != constant.TaskActionImageEdit {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations/") && originTask.Action != constant.TaskActionImageGenerate {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
+	}
+
+	imageTask := dto.OpenAIImageTask{
+		ID:        originTask.TaskID,
+		Model:     originTask.Properties.OriginModelName,
+		Object:    "image.generation",
+		Progress:  originTask.Progress,
+		Status:    imageTaskPublicStatus(originTask.Status),
+		CreatedAt: originTask.CreatedAt,
+	}
+	if imageTask.Progress == "" {
+		imageTask.Progress = imageTaskDefaultProgress(originTask.Status)
+	}
+
+	var upstream struct {
+		Model string          `json:"model"`
+		Data  []dto.ImageData `json:"data"`
+		Error *struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error,omitempty"`
+	}
+	if len(originTask.Data) > 0 {
+		_ = common.Unmarshal(originTask.Data, &upstream)
+	}
+	if imageTask.Model == "" {
+		imageTask.Model = upstream.Model
+	}
+	imageTask.Data = upstream.Data
+	if len(imageTask.Data) == 0 && originTask.GetResultURL() != "" {
+		imageTask.Data = []dto.ImageData{{Url: originTask.GetResultURL()}}
+	}
+	if originTask.Status == model.TaskStatusFailure {
+		message := originTask.FailReason
+		code := "task_failed"
+		if upstream.Error != nil {
+			if upstream.Error.Message != "" {
+				message = upstream.Error.Message
+			}
+			if upstream.Error.Code != "" {
+				code = upstream.Error.Code
+			}
+		}
+		if message == "" {
+			message = "task failed"
+		}
+		imageTask.Error = &dto.ImageTaskError{Message: message, Code: code}
+	}
+	respBody, err = common.Marshal(imageTask)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
+	}
+	return respBody, nil
+}
+
+func imageTaskPublicStatus(status model.TaskStatus) string {
+	switch status {
+	case model.TaskStatusSuccess:
+		return dto.ImageTaskStatusCompleted
+	case model.TaskStatusFailure:
+		return dto.ImageTaskStatusFailed
+	case model.TaskStatusInProgress:
+		return dto.ImageTaskStatusInProgress
+	default:
+		return dto.ImageTaskStatusQueued
+	}
+}
+
+func imageTaskDefaultProgress(status model.TaskStatus) string {
+	switch status {
+	case model.TaskStatusSuccess, model.TaskStatusFailure:
+		return "100%"
+	case model.TaskStatusInProgress:
+		return "50%"
+	default:
+		return "10%"
+	}
 }
 
 // tryRealtimeFetch 尝试从上游实时拉取 Gemini/Vertex 任务状态。

@@ -18,6 +18,7 @@ const MaxImageN = 128
 type ImageRequest struct {
 	Model             string          `json:"model"`
 	Prompt            string          `json:"prompt" binding:"required"`
+	Async             *bool           `json:"async,omitempty"`
 	N                 *uint           `json:"n,omitempty"`
 	Size              string          `json:"size,omitempty"`
 	Quality           string          `json:"quality,omitempty"`
@@ -173,6 +174,13 @@ func (i *ImageRequest) GetTokenCountMeta() *types.TokenCountMeta {
 
 func (i *ImageRequest) IsStream(c *gin.Context) bool {
 	return i.Stream != nil && *i.Stream
+}
+
+func (i *ImageRequest) IsAsync(c *gin.Context) bool {
+	if i.Async != nil && *i.Async {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(c.Query("async")), "true")
 }
 
 func (i *ImageRequest) SetModelName(modelName string) {

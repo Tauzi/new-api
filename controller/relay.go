@@ -123,6 +123,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
+	// Async image requests use the task billing and polling lifecycle. Keep the
+	// existing synchronous image relay untouched for requests without async=true.
+	if relayFormat == types.RelayFormatOpenAIImage {
+		if imageRequest, ok := request.(*dto.ImageRequest); ok && imageRequest.IsAsync(c) {
+			c.Set("platform", string(constant.TaskPlatformAsyncImage))
+			RelayTask(c)
+			return
+		}
+	}
+
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
 	// Avoid building huge CombineText (strings.Join) when token counting and sensitive check are both disabled.
@@ -579,6 +589,10 @@ func RelayTask(c *gin.Context) {
 		service.LogTaskConsumption(c, relayInfo)
 
 		task := model.InitTask(result.Platform, relayInfo)
+		if result.Platform == constant.TaskPlatformAsyncImage {
+			task.Status = model.TaskStatusQueued
+			task.Progress = "10%"
+		}
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId

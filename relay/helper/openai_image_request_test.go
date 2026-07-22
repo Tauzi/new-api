@@ -158,3 +158,20 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 		require.Contains(t, err.Error(), boundErr)
 	})
 }
+
+func TestGetAndValidOpenAIImageRequestParsesAsync(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "gpt-image-2-async"))
+	require.NoError(t, writer.WriteField("prompt", "edit this image"))
+	require.NoError(t, writer.WriteField("async", "true"))
+	require.NoError(t, writer.Close())
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	req, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
+	require.NoError(t, err)
+	require.True(t, req.IsAsync(c))
+}

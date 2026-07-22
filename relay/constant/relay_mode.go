@@ -42,6 +42,8 @@ const (
 
 	RelayModeVideoFetchByID
 	RelayModeVideoSubmit
+	RelayModeImageGenerationsFetchByID
+	RelayModeImageEditsFetchByID
 
 	RelayModeRerank
 
@@ -66,8 +68,12 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeEmbeddings
 	} else if strings.HasPrefix(path, "/v1/moderations") {
 		relayMode = RelayModeModerations
+	} else if strings.HasPrefix(path, "/v1/images/generations/") {
+		relayMode = RelayModeImageGenerationsFetchByID
 	} else if strings.HasPrefix(path, "/v1/images/generations") {
 		relayMode = RelayModeImagesGenerations
+	} else if strings.HasPrefix(path, "/v1/images/edits/") {
+		relayMode = RelayModeImageEditsFetchByID
 	} else if strings.HasPrefix(path, "/v1/images/edits") {
 		relayMode = RelayModeImagesEdits
 	} else if strings.HasPrefix(path, "/v1/edits") {
