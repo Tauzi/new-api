@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const testModel = "gpt-image-2-4k-async"
+
 func newJSONContext(t *testing.T, body string) *gin.Context {
 	t.Helper()
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -36,9 +38,9 @@ func newJSONContext(t *testing.T, body string) *gin.Context {
 func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 	c := newJSONContext(t, `{
 		"async": true,
-		"image_size": "1k",
+		"image_size": "4k",
 		"images": ["https://example.com/reference.png"],
-		"model": "gpt-image-2-async",
+		"model": "gpt-image-2-4k-async",
 		"n": 1,
 		"prompt": "city at night",
 		"quality": "auto",
@@ -46,9 +48,9 @@ func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 	}`)
 	info := &relaycommon.RelayInfo{
 		RelayMode:       relayconstant.RelayModeImagesGenerations,
-		OriginModelName: modelName,
+		OriginModelName: testModel,
 		ChannelMeta: &relaycommon.ChannelMeta{
-			UpstreamModelName: modelName,
+			UpstreamModelName: testModel,
 		},
 	}
 	adaptor := &TaskAdaptor{}
@@ -62,40 +64,31 @@ func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 
 	var got map[string]any
 	require.NoError(t, common.Unmarshal(body, &got))
-	assert.Equal(t, modelName, got["model"])
+	assert.Equal(t, testModel, got["model"])
 	assert.Equal(t, true, got["async"])
 	assert.EqualValues(t, 1, got["n"])
 	assert.Equal(t, "medium", got["quality"])
-	assert.Equal(t, "1K", got["image_size"])
+	assert.Equal(t, "4k", got["image_size"])
 	assert.Equal(t, "1024x1024", got["size"])
 	assert.Equal(t, []any{"https://example.com/reference.png"}, got["images"])
 }
 
-func TestValidateSize(t *testing.T) {
-	tests := []struct {
-		name    string
-		value   string
-		wantErr bool
-	}{
-		{name: "square", value: "1024x1024"},
-		{name: "exact dimensions", value: "1024x768"},
-		{name: "ratio", value: "16:9"},
-		{name: "not aligned", value: "1000x1000", wantErr: true},
-		{name: "too few pixels", value: "512x512", wantErr: true},
-		{name: "too many pixels", value: "2048x1024", wantErr: true},
-		{name: "ratio too wide", value: "2048x512", wantErr: true},
-		{name: "ratio input too wide", value: "4:1", wantErr: true},
+func TestValidateRequestAllowsModelSpecificSize(t *testing.T) {
+	c := newJSONContext(t, `{
+		"async": true,
+		"model": "vendor-image-8k-async",
+		"prompt": "large canvas",
+		"size": "8192x8192",
+		"image_size": "8k"
+	}`)
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+		OriginModelName: "vendor-image-8k-async",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "vendor-image-8k-async",
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateSize(tt.value)
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
+	assert.Nil(t, (&TaskAdaptor{}).ValidateRequestAndSetAction(c, info))
 }
 
 func TestValidateJSONReferencesDeduplicatesAliases(t *testing.T) {
@@ -159,7 +152,7 @@ func TestDoResponseHidesUpstreamTaskID(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	info := &relaycommon.RelayInfo{
-		OriginModelName: modelName,
+		OriginModelName: testModel,
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{
 			PublicTaskID: "task_public",
 		},
@@ -168,7 +161,7 @@ func TestDoResponseHidesUpstreamTaskID(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Body: io.NopCloser(bytes.NewBufferString(`{
 			"id":"task_upstream",
-			"model":"gpt-image-2-async",
+			"model":"gpt-image-2-4k-async",
 			"object":"image.generation",
 			"progress":"10%",
 			"status":"queued"
@@ -185,7 +178,7 @@ func TestDoResponseHidesUpstreamTaskID(t *testing.T) {
 func TestBuildMultipartBodyPreservesRepeatedImages(t *testing.T) {
 	var original bytes.Buffer
 	writer := multipart.NewWriter(&original)
-	require.NoError(t, writer.WriteField("model", modelName))
+	require.NoError(t, writer.WriteField("model", testModel))
 	require.NoError(t, writer.WriteField("prompt", "edit these images"))
 	require.NoError(t, writer.WriteField("async", "true"))
 	require.NoError(t, writer.WriteField("quality", "auto"))
@@ -203,9 +196,9 @@ func TestBuildMultipartBodyPreservesRepeatedImages(t *testing.T) {
 	t.Cleanup(func() { common.CleanupBodyStorage(c) })
 	info := &relaycommon.RelayInfo{
 		RelayMode:       relayconstant.RelayModeImagesEdits,
-		OriginModelName: modelName,
+		OriginModelName: testModel,
 		ChannelMeta: &relaycommon.ChannelMeta{
-			UpstreamModelName: modelName,
+			UpstreamModelName: testModel,
 		},
 	}
 	adaptor := &TaskAdaptor{}
@@ -222,7 +215,7 @@ func TestBuildMultipartBodyPreservesRepeatedImages(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = form.RemoveAll() })
 
-	assert.Equal(t, modelName, form.Value["model"][0])
+	assert.Equal(t, testModel, form.Value["model"][0])
 	assert.Equal(t, "true", form.Value["async"][0])
 	assert.Equal(t, "1", form.Value["n"][0])
 	assert.Equal(t, "medium", form.Value["quality"][0])
@@ -233,7 +226,7 @@ func TestValidateMultipartMask(t *testing.T) {
 	buildContext := func(t *testing.T, input, mask []byte) *gin.Context {
 		var body bytes.Buffer
 		writer := multipart.NewWriter(&body)
-		require.NoError(t, writer.WriteField("model", modelName))
+		require.NoError(t, writer.WriteField("model", testModel))
 		require.NoError(t, writer.WriteField("prompt", "edit the transparent area"))
 		require.NoError(t, writer.WriteField("async", "true"))
 		for field, data := range map[string][]byte{"image": input, "mask": mask} {
@@ -254,7 +247,7 @@ func TestValidateMultipartMask(t *testing.T) {
 		return &relaycommon.RelayInfo{
 			RelayMode: relayconstant.RelayModeImagesEdits,
 			ChannelMeta: &relaycommon.ChannelMeta{
-				UpstreamModelName: modelName,
+				UpstreamModelName: testModel,
 			},
 		}
 	}

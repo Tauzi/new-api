@@ -28,12 +28,7 @@ import (
 )
 
 const (
-	modelName      = "gpt-image-2-async"
-	maxImageBytes  = 10 << 20
-	minImagePixels = 655360
-	maxImagePixels = 1048576
-	maxImageSide   = 3840
-	maxImageRatio  = 3.0
+	maxImageBytes = 10 << 20
 )
 
 type TaskAdaptor struct {
@@ -79,9 +74,6 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		info.Action = constant.TaskActionImageGenerate
 	}
 
-	if info.UpstreamModelName != "" && info.UpstreamModelName != modelName {
-		return taskError(fmt.Errorf("async image model must be %s", modelName), "invalid_model")
-	}
 	if err := validateRequest(c, info); err != nil {
 		return taskError(err, "invalid_request")
 	}
@@ -131,7 +123,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err := common.Unmarshal(body, &fields); err != nil {
 		return nil, fmt.Errorf("decode image request: %w", err)
 	}
-	fields["model"] = json.RawMessage(strconv.Quote(modelName))
+	model, err := resolveModel(info, fields)
+	if err != nil {
+		return nil, err
+	}
+	fields["model"] = json.RawMessage(strconv.Quote(model))
 	fields["async"] = json.RawMessage("true")
 	fields["n"] = json.RawMessage("1")
 	quality := "medium"
@@ -142,11 +138,6 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		}
 	}
 	fields["quality"] = json.RawMessage(strconv.Quote(quality))
-	for _, key := range []string{"image_size", "output_resolution"} {
-		if value, ok := fields[key]; ok && len(value) > 0 && string(value) != "null" {
-			fields[key] = json.RawMessage(strconv.Quote("1K"))
-		}
-	}
 	out, err := common.Marshal(fields)
 	if err != nil {
 		return nil, err
@@ -163,7 +154,11 @@ func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.Relay
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	if err := writer.WriteField("model", modelName); err != nil {
+	model, err := resolveMultipartModel(info, form.Value)
+	if err != nil {
+		return nil, err
+	}
+	if err := writer.WriteField("model", model); err != nil {
 		return nil, err
 	}
 	if err := writer.WriteField("async", "true"); err != nil {
@@ -181,8 +176,8 @@ func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.Relay
 		return nil, err
 	}
 	for _, key := range []string{"image_size", "output_resolution"} {
-		if formValues.Get(key) != "" {
-			if err := writer.WriteField(key, "1K"); err != nil {
+		if value := formValues.Get(key); value != "" {
+			if err := writer.WriteField(key, value); err != nil {
 				return nil, err
 			}
 		}
@@ -329,7 +324,9 @@ func (a *TaskAdaptor) ParseTaskResult(body []byte) (*relaycommon.TaskInfo, error
 }
 
 func (a *TaskAdaptor) GetModelList() []string {
-	return []string{modelName}
+	// Async image model names are configured per channel and are intentionally
+	// not restricted to one hard-coded model.
+	return nil
 }
 
 func (a *TaskAdaptor) GetChannelName() string {
@@ -347,10 +344,13 @@ func validateRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
 	}
 	contentType := c.GetHeader("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return validateMultipartRequest(c)
+		return validateMultipartRequest(c, info)
 	}
 	var fields map[string]json.RawMessage
 	if err := common.Unmarshal(body, &fields); err != nil {
+		return err
+	}
+	if _, err := resolveModel(info, fields); err != nil {
 		return err
 	}
 	prompt, _ := rawString(fields["prompt"])
@@ -364,31 +364,48 @@ func validateRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
 	if quality != "" && !strings.EqualFold(quality, "auto") && quality != "low" && quality != "medium" && quality != "high" {
 		return fmt.Errorf("quality must be low, medium, high, or auto")
 	}
-	if size, ok := rawString(fields["size"]); ok && size != "" {
-		if err := validateSize(size); err != nil {
-			return err
-		}
-	}
-	for _, key := range []string{"image_size", "output_resolution"} {
-		if value, ok := rawString(fields[key]); ok && value != "" && !strings.EqualFold(value, "1k") {
-			return fmt.Errorf("%s must be 1K", key)
-		}
-	}
 	if err := validateJSONReferences(fields); err != nil {
 		return err
-	}
-	if info.UpstreamModelName != "" && info.UpstreamModelName != modelName {
-		return fmt.Errorf("async image model must be %s", modelName)
 	}
 	return nil
 }
 
-func validateMultipartRequest(c *gin.Context) error {
+func resolveModel(info *relaycommon.RelayInfo, fields map[string]json.RawMessage) (string, error) {
+	if model := configuredModel(info); model != "" {
+		return model, nil
+	}
+	if model, ok := rawString(fields["model"]); ok && strings.TrimSpace(model) != "" {
+		return strings.TrimSpace(model), nil
+	}
+	return "", fmt.Errorf("model is required")
+}
+
+func resolveMultipartModel(info *relaycommon.RelayInfo, fields map[string][]string) (string, error) {
+	if model := configuredModel(info); model != "" {
+		return model, nil
+	}
+	if model := strings.TrimSpace(url.Values(fields).Get("model")); model != "" {
+		return model, nil
+	}
+	return "", fmt.Errorf("model is required")
+}
+
+func configuredModel(info *relaycommon.RelayInfo) string {
+	if info == nil || info.ChannelMeta == nil {
+		return ""
+	}
+	return strings.TrimSpace(info.UpstreamModelName)
+}
+
+func validateMultipartRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
 	form, err := common.ParseMultipartFormReusable(c)
 	if err != nil {
 		return err
 	}
 	formValues := url.Values(form.Value)
+	if _, err := resolveMultipartModel(info, form.Value); err != nil {
+		return err
+	}
 	if strings.TrimSpace(formValues.Get("prompt")) == "" {
 		return fmt.Errorf("prompt is required")
 	}
@@ -398,16 +415,6 @@ func validateMultipartRequest(c *gin.Context) error {
 	quality := strings.ToLower(strings.TrimSpace(formValues.Get("quality")))
 	if quality != "" && quality != "auto" && quality != "low" && quality != "medium" && quality != "high" {
 		return fmt.Errorf("quality must be low, medium, high, or auto")
-	}
-	if size := strings.TrimSpace(formValues.Get("size")); size != "" {
-		if err := validateSize(size); err != nil {
-			return err
-		}
-	}
-	for _, key := range []string{"image_size", "output_resolution"} {
-		if value := strings.TrimSpace(formValues.Get(key)); value != "" && !strings.EqualFold(value, "1k") {
-			return fmt.Errorf("%s must be 1K", key)
-		}
 	}
 	for _, key := range []string{"image", "images", "mask"} {
 		for _, header := range form.File[key] {
@@ -564,41 +571,6 @@ func pngHasAlpha(data []byte) bool {
 		return true
 	}
 	return bytes.Contains(data, []byte("tRNS"))
-}
-
-func validateSize(value string) error {
-	if strings.Contains(value, ":") {
-		parts := strings.Split(value, ":")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid size ratio")
-		}
-		w, err1 := strconv.ParseFloat(parts[0], 64)
-		h, err2 := strconv.ParseFloat(parts[1], 64)
-		if err1 != nil || err2 != nil || w <= 0 || h <= 0 || w/h > maxImageRatio || h/w > maxImageRatio {
-			return fmt.Errorf("size ratio must not exceed 3:1")
-		}
-		return nil
-	}
-	parts := strings.Split(value, "x")
-	if len(parts) != 2 {
-		return fmt.Errorf("size must be WIDTHxHEIGHT or W:H")
-	}
-	w, err1 := strconv.Atoi(parts[0])
-	h, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
-		return fmt.Errorf("invalid size")
-	}
-	if w%16 != 0 || h%16 != 0 || w > maxImageSide || h > maxImageSide {
-		return fmt.Errorf("size dimensions must be 16-aligned and no larger than 3840")
-	}
-	pixels := w * h
-	if pixels < minImagePixels || pixels > maxImagePixels {
-		return fmt.Errorf("size pixel count must be between %d and %d", minImagePixels, maxImagePixels)
-	}
-	if float64(w)/float64(h) > maxImageRatio || float64(h)/float64(w) > maxImageRatio {
-		return fmt.Errorf("size ratio must not exceed 3:1")
-	}
-	return nil
 }
 
 func rawString(value json.RawMessage) (string, bool) {

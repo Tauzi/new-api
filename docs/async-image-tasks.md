@@ -6,8 +6,10 @@
 ## 渠道配置
 
 - 渠道 Base URL 可填写 `https://mianyunai.com` 或 `https://mianyunai.com/v1`。
-- 渠道模型必须包含 `gpt-image-2-async`。
-- 在系统模型定价中为 `gpt-image-2-async` 配置按次价格。代码不会预设价格，
+- 请求体中的 `async=true` 负责切换到异步任务；模型名不写死，渠道中配置的模型名会原样转发。
+  例如 `gpt-image-2-async`、`gpt-image-2-4k-async` 以及后续新增模型都可以使用。
+- `size`、`image_size`、`output_resolution` 等尺寸字段不在 NewAPI 中按固定模型档位改写，按请求值转发给上游校验。
+- 在系统模型定价中为每个异步模型分别配置按次价格。代码不会预设价格，
   以避免覆盖实际采购成本。
 - 保持 `UPDATE_TASK=true`（默认值），否则后台不会轮询异步任务。
 
