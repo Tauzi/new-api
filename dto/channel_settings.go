@@ -34,6 +34,7 @@ const (
 )
 
 type ChannelOtherSettings struct {
+	ImageTaskMode                         string                `json:"image_task_mode,omitempty"` // "async" uses upstream task polling; "sync" runs the upstream image request in NewAPI's task worker
 	AzureResponsesVersion                 string                `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType         `json:"vertex_key_type,omitempty"` // "json" or "api_key"
 	OpenRouterEnterprise                  *bool                 `json:"openrouter_enterprise,omitempty"`
@@ -53,6 +54,13 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
+}
+
+func (s ChannelOtherSettings) GetImageTaskMode() string {
+	if strings.EqualFold(strings.TrimSpace(s.ImageTaskMode), constant.TaskImageUpstreamModeSync) {
+		return constant.TaskImageUpstreamModeSync
+	}
+	return constant.TaskImageUpstreamModeAsync
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

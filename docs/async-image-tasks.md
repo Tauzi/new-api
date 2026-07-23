@@ -1,14 +1,19 @@
 # 异步图片任务
 
-本分支为 OpenAI 图片接口增加了可选的异步任务模式。未传 `async` 或传
-`async=false` 时，仍使用 NewAPI 原有的同步图片转发流程。
+本分支为 OpenAI 图片接口增加了统一的异步任务接口。客户端提交后立即拿到
+NewAPI 生成的任务 ID，渠道设置决定 NewAPI 如何调用上游。
 
 ## 渠道配置
 
 - 渠道 Base URL 可填写 `https://mianyunai.com` 或 `https://mianyunai.com/v1`。
-- 请求体中的 `async=true` 负责切换到异步任务；模型名不写死，渠道中配置的模型名会原样转发。
+- 客户端请求建议传 `async=true`。模型名不写死，渠道中配置的模型名会原样转发。
   例如 `gpt-image-2-async`、`gpt-image-2-4k-async` 以及后续新增模型都可以使用。
 - `size`、`image_size`、`output_resolution` 等尺寸字段不在 NewAPI 中按固定模型档位改写，按请求值转发给上游校验。
+- 渠道高级设置中的“图片任务上游模式”有两种选择：
+  - `async`（默认）：上游返回 `task_id`，NewAPI 后台轮询上游任务。
+  - `sync`：上游直接返回图片，NewAPI 先保存本地任务，再由后台任务执行同步请求并写回结果。
+- 配置保存到渠道 `settings` JSON 时，对应字段为
+  `{"image_task_mode":"async"}` 或 `{"image_task_mode":"sync"}`。
 - 在系统模型定价中为每个异步模型分别配置按次价格。代码不会预设价格，
   以避免覆盖实际采购成本。
 - 保持 `UPDATE_TASK=true`（默认值），否则后台不会轮询异步任务。

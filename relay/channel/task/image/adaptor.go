@@ -2,6 +2,7 @@ package image
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -105,6 +106,10 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, _ *r
 }
 
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+	return a.buildRequestBody(c, info, true)
+}
+
+func (a *TaskAdaptor) buildRequestBody(c *gin.Context, info *relaycommon.RelayInfo, upstreamAsync bool) (io.Reader, error) {
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return nil, fmt.Errorf("get request body: %w", err)
@@ -116,7 +121,7 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 
 	contentType := c.GetHeader("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return a.buildMultipartBody(c, info)
+		return a.buildMultipartBody(c, info, upstreamAsync)
 	}
 
 	var fields map[string]json.RawMessage
@@ -128,7 +133,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		return nil, err
 	}
 	fields["model"] = json.RawMessage(strconv.Quote(model))
-	fields["async"] = json.RawMessage("true")
+	if upstreamAsync {
+		fields["async"] = json.RawMessage("true")
+	} else {
+		delete(fields, "async")
+	}
 	fields["n"] = json.RawMessage("1")
 	quality := "medium"
 	if value, ok := fields["quality"]; ok {
@@ -146,7 +155,7 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	return bytes.NewReader(out), nil
 }
 
-func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
+func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.RelayInfo, upstreamAsync bool) (io.Reader, error) {
 	form, err := common.ParseMultipartFormReusable(c)
 	if err != nil {
 		return nil, fmt.Errorf("parse multipart image request: %w", err)
@@ -161,8 +170,10 @@ func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.Relay
 	if err := writer.WriteField("model", model); err != nil {
 		return nil, err
 	}
-	if err := writer.WriteField("async", "true"); err != nil {
-		return nil, err
+	if upstreamAsync {
+		if err := writer.WriteField("async", "true"); err != nil {
+			return nil, err
+		}
 	}
 	if err := writer.WriteField("n", "1"); err != nil {
 		return nil, err
@@ -229,6 +240,100 @@ func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.Relay
 	c.Set("image_task_content_type", writer.FormDataContentType())
 	_ = info
 	return &body, nil
+}
+
+func (a *TaskAdaptor) PrepareLocalTask(c *gin.Context, info *relaycommon.RelayInfo) (*channel.LocalTaskData, bool, error) {
+	if !a.isSyncMode(info) {
+		return nil, false, nil
+	}
+
+	bodyReader, err := a.buildRequestBody(c, info, false)
+	if err != nil {
+		return nil, true, err
+	}
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		return nil, true, fmt.Errorf("read local task body: %w", err)
+	}
+	publicTask := dto.NewOpenAIImageTask(info.PublicTaskID, info.OriginModelName)
+	c.JSON(http.StatusOK, publicTask)
+	contentType := c.GetString("image_task_content_type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	return &channel.LocalTaskData{RequestBody: body, ContentType: contentType}, true, nil
+}
+
+func (a *TaskAdaptor) isSyncMode(info *relaycommon.RelayInfo) bool {
+	return info != nil && info.ChannelOtherSettings.GetImageTaskMode() == constant.TaskImageUpstreamModeSync
+}
+
+func (a *TaskAdaptor) ExecuteLocalTask(ctx context.Context, task *model.Task, ch *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
+	if task == nil || ch == nil {
+		return nil, nil, fmt.Errorf("local image task or channel is nil")
+	}
+	if len(task.PrivateData.RequestBody) == 0 {
+		return nil, nil, fmt.Errorf("local image task request body is empty")
+	}
+
+	baseURL := ch.GetBaseURL()
+	if baseURL == "" {
+		baseURL = constant.ChannelBaseURLs[ch.Type]
+	}
+	path := "/v1/images/generations"
+	if task.Action == constant.TaskActionImageEdit {
+		path = "/v1/images/edits"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, buildEndpoint(baseURL, path), bytes.NewReader(task.PrivateData.RequestBody))
+	if err != nil {
+		return nil, nil, err
+	}
+	key := ch.Key
+	if task.PrivateData.Key != "" {
+		key = task.PrivateData.Key
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	contentType := task.PrivateData.RequestContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "application/json")
+	client, err := service.GetHttpClientWithProxy(ch.GetSetting().Proxy)
+	if err != nil {
+		return nil, nil, fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, responseBody, fmt.Errorf("upstream image request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	var response imageTaskResponse
+	if err := common.Unmarshal(responseBody, &response); err != nil {
+		return nil, responseBody, fmt.Errorf("decode synchronous image response: %w", err)
+	}
+	if response.Error != nil {
+		return nil, responseBody, fmt.Errorf("upstream image request failed: %s", response.Error.Message)
+	}
+	if len(response.Data) == 0 {
+		return nil, responseBody, fmt.Errorf("upstream synchronous image response has no data")
+	}
+	return &relaycommon.TaskInfo{
+		TaskID:   task.TaskID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: taskcommon.ProgressComplete,
+		Url:      response.Data[0].Url,
+	}, responseBody, nil
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {

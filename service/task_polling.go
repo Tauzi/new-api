@@ -33,6 +33,13 @@ type TaskPollingAdaptor interface {
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
 }
 
+// LocalTaskExecutor handles tasks whose upstream request is synchronous. The
+// submit endpoint has already persisted the request body and returned the
+// public task ID; this method runs later in the task worker.
+type LocalTaskExecutor interface {
+	ExecuteLocalTask(ctx context.Context, task *model.Task, ch *model.Channel) (*relaycommon.TaskInfo, []byte, error)
+}
+
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
@@ -160,13 +167,20 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
+	localPlatformTask := make(map[constant.TaskPlatform][]*model.Task)
+	platforms := make(map[constant.TaskPlatform]struct{})
 	for _, t := range allTasks {
+		platforms[t.Platform] = struct{}{}
+		if t.PrivateData.UpstreamMode == constant.TaskImageUpstreamModeSync && len(t.PrivateData.RequestBody) > 0 {
+			localPlatformTask[t.Platform] = append(localPlatformTask[t.Platform], t)
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
 	}
 
-	totalPlatforms := len(platformTask)
+	totalPlatforms := len(platforms)
 	processedPlatforms := 0
-	for platform, tasks := range platformTask {
+	for platform := range platforms {
 		if ctx.Err() != nil {
 			break
 		}
@@ -174,10 +188,17 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 			report(processedPlatforms, totalPlatforms)
 		}
 		processedPlatforms++
-		if len(tasks) == 0 {
+		tasks := platformTask[platform]
+		localTasks := localPlatformTask[platform]
+		if len(tasks) == 0 && len(localTasks) == 0 {
 			continue
 		}
 		summary.PlatformsScanned++
+		if len(localTasks) > 0 {
+			if err := UpdateLocalTasks(ctx, platform, localTasks); err != nil {
+				common.SysLog(fmt.Sprintf("UpdateLocalTasks fail: %s", err))
+			}
+		}
 		taskChannelM := make(map[int][]string)
 		taskM := make(map[string]*model.Task)
 		nullTaskIds := make([]int64, 0)
@@ -214,6 +235,131 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	}
 	common.SysLog("任务进度轮询完成")
 	return summary
+}
+
+// UpdateLocalTasks executes persisted tasks for synchronous upstreams. Unlike
+// remote task polling, a local task has no provider task ID and must be run
+// exactly once from its queued state in this pass.
+func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks []*model.Task) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	if GetTaskAdaptorFunc == nil {
+		return errors.New("task adaptor factory not configured")
+	}
+	adaptor := GetTaskAdaptorFunc(platform)
+	if adaptor == nil {
+		return fmt.Errorf("task adaptor not found for platform %s", platform)
+	}
+	executor, ok := adaptor.(LocalTaskExecutor)
+	if !ok {
+		return fmt.Errorf("platform %s does not support local task execution", platform)
+	}
+	for _, task := range tasks {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if task == nil || task.Status == model.TaskStatusInProgress {
+			continue
+		}
+		if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
+		}
+	}
+	return nil
+}
+
+func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, executor LocalTaskExecutor, task *model.Task) error {
+	ch, err := model.CacheGetChannel(task.ChannelId)
+	if err != nil {
+		return fmt.Errorf("get channel %d: %w", task.ChannelId, err)
+	}
+
+	previousStatus := task.Status
+	now := time.Now().Unix()
+	task.Status = model.TaskStatusInProgress
+	task.Progress = taskcommon.ProgressInProgress
+	if task.StartTime == 0 {
+		task.StartTime = now
+	}
+	won, err := task.UpdateWithStatus(previousStatus)
+	if err != nil {
+		return fmt.Errorf("claim local task %s: %w", task.TaskID, err)
+	}
+	if !won {
+		return nil
+	}
+
+	taskResult, responseBody, executeErr := executor.ExecuteLocalTask(ctx, task, ch)
+	if executeErr != nil {
+		if err := failLocalTask(ctx, task, executeErr.Error(), responseBody); err != nil {
+			return err
+		}
+		return executeErr
+	}
+	if taskResult == nil {
+		err := fmt.Errorf("local task %s returned no result", task.TaskID)
+		if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
+			return persistErr
+		}
+		return err
+	}
+
+	task.Status = model.TaskStatus(taskResult.Status)
+	if task.Status == "" {
+		task.Status = model.TaskStatusSuccess
+	}
+	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		err := fmt.Errorf("local task %s returned non-terminal status %s", task.TaskID, task.Status)
+		if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
+			return persistErr
+		}
+		return err
+	}
+	task.Progress = taskResult.Progress
+	if task.Progress == "" {
+		task.Progress = taskcommon.ProgressComplete
+	}
+	task.FinishTime = time.Now().Unix()
+	task.Data = responseBody
+	task.PrivateData.RequestBody = nil
+	task.PrivateData.RequestContentType = ""
+	if taskResult.Url != "" {
+		task.PrivateData.ResultURL = taskResult.Url
+	}
+	if task.Status == model.TaskStatusFailure {
+		task.FailReason = taskResult.Reason
+	}
+	updated, err := task.UpdateWithStatus(model.TaskStatusInProgress)
+	if err != nil {
+		return fmt.Errorf("persist local task result %s: %w", task.TaskID, err)
+	}
+	if !updated {
+		return nil
+	}
+	if task.Status == model.TaskStatusSuccess {
+		settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+	} else if task.Status == model.TaskStatusFailure && task.Quota != 0 {
+		RefundTaskQuota(ctx, task, task.FailReason)
+	}
+	return nil
+}
+
+func failLocalTask(ctx context.Context, task *model.Task, reason string, responseBody []byte) error {
+	task.Status = model.TaskStatusFailure
+	task.Progress = taskcommon.ProgressComplete
+	task.FinishTime = time.Now().Unix()
+	task.FailReason = reason
+	task.Data = responseBody
+	task.PrivateData.RequestBody = nil
+	task.PrivateData.RequestContentType = ""
+	if _, updateErr := task.UpdateWithStatus(model.TaskStatusInProgress); updateErr != nil {
+		return fmt.Errorf("persist local task failure %s: %w", task.TaskID, updateErr)
+	}
+	if task.Quota != 0 {
+		RefundTaskQuota(ctx, task, task.FailReason)
+	}
+	return nil
 }
 
 // DispatchPlatformUpdate 按平台分发轮询更新

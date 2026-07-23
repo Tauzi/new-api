@@ -33,6 +33,34 @@ type sunoFailurePollingAdaptor struct {
 	failReason string
 }
 
+type localTaskExecutorAdaptor struct {
+	calls int
+}
+
+func (a *localTaskExecutorAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *localTaskExecutorAdaptor) FetchTask(_ string, _ string, _ map[string]any, _ string) (*http.Response, error) {
+	return nil, nil
+}
+
+func (a *localTaskExecutorAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (a *localTaskExecutorAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+func (a *localTaskExecutorAdaptor) ExecuteLocalTask(_ context.Context, task *model.Task, _ *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
+	a.calls++
+	return &relaycommon.TaskInfo{
+		TaskID:   task.TaskID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: "100%",
+		Url:      "https://example.com/local.png",
+	}, []byte(`{"data":[{"url":"https://example.com/local.png"}]}`), nil
+}
+
 func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *sunoFailurePollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
@@ -162,6 +190,41 @@ func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID st
 	}
 	require.NoError(t, model.DB.Create(task).Error)
 	return task
+}
+
+func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
+	truncate(t)
+	const channelID = 601
+	seedTaskPollingChannel(t, channelID, true)
+	task := &model.Task{
+		TaskID:    "task_local_sync",
+		Platform:  constant.TaskPlatformAsyncImage,
+		UserId:    1,
+		ChannelId: channelID,
+		Action:    constant.TaskActionImageGenerate,
+		Status:    model.TaskStatusQueued,
+		Progress:  "10%",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+			RequestContentType: "application/json",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	executor := &localTaskExecutorAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return executor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	assert.Equal(t, 1, executor.calls)
+	assert.Equal(t, model.TaskStatus("SUCCESS"), task.Status)
+	assert.Equal(t, "100%", task.Progress)
+	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
+	assert.Empty(t, task.PrivateData.RequestBody)
 }
 
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {

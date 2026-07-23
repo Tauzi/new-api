@@ -2,6 +2,7 @@ package image
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	stdimage "image"
 	"image/color"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -71,6 +73,66 @@ func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 	assert.Equal(t, "4k", got["image_size"])
 	assert.Equal(t, "1024x1024", got["size"])
 	assert.Equal(t, []any{"https://example.com/reference.png"}, got["images"])
+}
+
+func TestPrepareLocalTaskUsesSynchronousUpstreamMode(t *testing.T) {
+	c := newJSONContext(t, `{
+		"async": true,
+		"model": "vendor-image-sync",
+		"prompt": "local worker",
+		"size": "2048x2048"
+	}`)
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+		OriginModelName: "vendor-image-sync",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "vendor-image-sync",
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				ImageTaskMode: constant.TaskImageUpstreamModeSync,
+			},
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_local"},
+	}
+
+	localData, isLocal, err := (&TaskAdaptor{}).PrepareLocalTask(c, info)
+	require.NoError(t, err)
+	require.True(t, isLocal)
+	require.NotNil(t, localData)
+
+	var upstreamBody map[string]any
+	require.NoError(t, common.Unmarshal(localData.RequestBody, &upstreamBody))
+	assert.Equal(t, "vendor-image-sync", upstreamBody["model"])
+	assert.Equal(t, "2048x2048", upstreamBody["size"])
+	assert.NotContains(t, upstreamBody, "async")
+}
+
+func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/v1/images/generations", r.URL.Path)
+		assert.Equal(t, "Bearer secret", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"vendor-image-sync","data":[{"url":"https://example.com/result.png"}]}`))
+	}))
+	defer server.Close()
+
+	task := &model.Task{
+		TaskID: "task_local",
+		Action: constant.TaskActionImageGenerate,
+		PrivateData: model.TaskPrivateData{
+			RequestBody:        []byte(`{"model":"vendor-image-sync","prompt":"test"}`),
+			RequestContentType: "application/json",
+		},
+	}
+	channelBaseURL := server.URL
+	ch := &model.Channel{BaseURL: &channelBaseURL, Key: "secret"}
+
+	result, responseBody, err := (&TaskAdaptor{}).ExecuteLocalTask(context.Background(), task, ch)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
+	assert.Equal(t, "https://example.com/result.png", result.Url)
+	assert.Contains(t, string(responseBody), "result.png")
 }
 
 func TestValidateRequestAllowsModelSpecificSize(t *testing.T) {

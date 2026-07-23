@@ -593,6 +593,14 @@ func RelayTask(c *gin.Context) {
 			task.Status = model.TaskStatusQueued
 			task.Progress = "10%"
 		}
+		if result.LocalTaskData != nil {
+			task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeSync
+			task.PrivateData.Key = relayInfo.ApiKey
+			task.PrivateData.RequestBody = result.LocalTaskData.RequestBody
+			task.PrivateData.RequestContentType = result.LocalTaskData.ContentType
+		} else if result.Platform == constant.TaskPlatformAsyncImage {
+			task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeAsync
+		}
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId

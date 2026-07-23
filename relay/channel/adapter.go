@@ -78,6 +78,20 @@ type TaskAdaptor interface {
 	ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error)
 }
 
+// LocalTaskData contains the request that a persisted local task must execute
+// after the submit response has already been returned to the client.
+type LocalTaskData struct {
+	RequestBody []byte
+	ContentType string
+}
+
+// LocalTaskSubmitter is implemented by task adaptors whose upstream is
+// synchronous. The adaptor returns true after writing the queued response and
+// persisting the request payload for the background worker.
+type LocalTaskSubmitter interface {
+	PrepareLocalTask(c *gin.Context, info *relaycommon.RelayInfo) (*LocalTaskData, bool, error)
+}
+
 type OpenAIVideoConverter interface {
 	ConvertToOpenAIVideo(originTask *model.Task) ([]byte, error)
 }

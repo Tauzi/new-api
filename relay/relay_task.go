@@ -25,6 +25,7 @@ import (
 type TaskSubmitResult struct {
 	UpstreamTaskID string
 	TaskData       []byte
+	LocalTaskData  *channel.LocalTaskData
 	Platform       constant.TaskPlatform
 	Quota          int
 	//PerCallPrice   types.PriceData
@@ -211,6 +212,20 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 8. 构建请求体
+	if localSubmitter, ok := adaptor.(channel.LocalTaskSubmitter); ok {
+		localTaskData, isLocal, localErr := localSubmitter.PrepareLocalTask(c, info)
+		if localErr != nil {
+			return nil, service.TaskErrorWrapper(localErr, "build_local_task_failed", http.StatusInternalServerError)
+		}
+		if isLocal {
+			return &TaskSubmitResult{
+				LocalTaskData: localTaskData,
+				Platform:      platform,
+				Quota:         info.PriceData.Quota,
+			}, nil
+		}
+	}
+
 	requestBody, err := adaptor.BuildRequestBody(c, info)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)

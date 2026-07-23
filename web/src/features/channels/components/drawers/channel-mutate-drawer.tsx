@@ -743,6 +743,7 @@ export function ChannelMutateDrawer({
   const currentDisableTaskPollingSleep = form.watch(
     'disable_task_polling_sleep'
   )
+  const currentImageTaskMode = form.watch('image_task_mode')
   const currentProxy = form.watch('proxy')
   const currentSystemPrompt = form.watch('system_prompt')
   const currentSystemPromptOverride = form.watch('system_prompt_override')
@@ -4171,6 +4172,48 @@ export function ChannelMutateDrawer({
                                         onCheckedChange={field.onChange}
                                       />
                                     </FormControl>
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='image_task_mode'
+                                render={({ field }) => (
+                                  <FormItem className='space-y-2 px-4 py-3'>
+                                    <FormLabel>
+                                      {t('Image task upstream mode')}
+                                    </FormLabel>
+                                    <Select
+                                      value={field.value || 'async'}
+                                      onValueChange={field.onChange}
+                                    >
+                                      <FormControl>
+                                        <SelectTrigger>
+                                          <SelectValue />
+                                        </SelectTrigger>
+                                      </FormControl>
+                                      <SelectContent>
+                                        <SelectGroup>
+                                          <SelectItem value='async'>
+                                            {t('Async upstream')}
+                                          </SelectItem>
+                                          <SelectItem value='sync'>
+                                            {t('Sync upstream')}
+                                          </SelectItem>
+                                        </SelectGroup>
+                                      </SelectContent>
+                                    </Select>
+                                    <FormDescription>
+                                      {currentImageTaskMode === 'sync'
+                                        ? t(
+                                            'NewAPI runs the upstream image request in the background task worker.'
+                                          )
+                                        : t(
+                                            'The upstream returns a task ID and NewAPI polls it in the background.'
+                                          )}
+                                    </FormDescription>
+                                    <FormMessage />
                                   </FormItem>
                                 )}
                               />

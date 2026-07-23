@@ -9,6 +9,11 @@ const (
 )
 
 const (
+	TaskImageUpstreamModeAsync = "async"
+	TaskImageUpstreamModeSync  = "sync"
+)
+
+const (
 	SunoActionMusic  = "MUSIC"
 	SunoActionLyrics = "LYRICS"
 
