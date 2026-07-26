@@ -69,6 +69,25 @@ function isOptionalProxyURL(value: string | undefined): boolean {
   }
 }
 
+function isOptionalHTTPURLPrefix(value: string | undefined): boolean {
+  const trimmedValue = value?.trim() || ''
+  if (!trimmedValue) return true
+
+  try {
+    const parsedURL = new URL(trimmedValue)
+    return (
+      (parsedURL.protocol === 'http:' || parsedURL.protocol === 'https:') &&
+      Boolean(parsedURL.hostname) &&
+      !parsedURL.username &&
+      !parsedURL.password &&
+      !parsedURL.search &&
+      !parsedURL.hash
+    )
+  } catch {
+    return false
+  }
+}
+
 function parseOptionalJson(value: string | undefined): unknown {
   if (!value?.trim()) return undefined
   return JSON.parse(value)
@@ -242,12 +261,39 @@ export const channelFormSchema = z
     claude_beta_query: z.boolean().optional(), // Anthropic: beta query passthrough
     disable_task_polling_sleep: z.boolean().optional(),
     image_task_mode: z.enum(['async', 'sync']).optional(),
+    image_url_source_prefix: z
+      .string()
+      .optional()
+      .refine(
+        isOptionalHTTPURLPrefix,
+        'Image URL prefix must be an absolute HTTP(S) URL without query or fragment'
+      ),
+    image_url_target_prefix: z
+      .string()
+      .optional()
+      .refine(
+        isOptionalHTTPURLPrefix,
+        'Image URL prefix must be an absolute HTTP(S) URL without query or fragment'
+      ),
     // Upstream model update settings (stored in settings JSON)
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    const hasImageURLSource = Boolean(data.image_url_source_prefix?.trim())
+    const hasImageURLTarget = Boolean(data.image_url_target_prefix?.trim())
+    if (hasImageURLSource !== hasImageURLTarget) {
+      const path = hasImageURLSource
+        ? 'image_url_target_prefix'
+        : 'image_url_source_prefix'
+      addRequiredIssue(
+        ctx,
+        path,
+        'Both image URL prefixes are required to enable replacement'
+      )
+    }
+
     if ([3, 8, 36, 45].includes(data.type) && !data.base_url?.trim()) {
       addRequiredIssue(
         ctx,
@@ -393,6 +439,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   claude_beta_query: false,
   disable_task_polling_sleep: false,
   image_task_mode: 'async',
+  image_url_source_prefix: '',
+  image_url_target_prefix: '',
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
@@ -450,6 +498,8 @@ export function transformChannelToFormDefaults(
   let claudeBetaQuery = false
   let disableTaskPollingSleep = false
   let imageTaskMode: 'async' | 'sync' = 'async'
+  let imageURLSourcePrefix = ''
+  let imageURLTargetPrefix = ''
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
@@ -471,6 +521,8 @@ export function transformChannelToFormDefaults(
       claudeBetaQuery = parsed.claude_beta_query === true
       disableTaskPollingSleep = parsed.disable_task_polling_sleep === true
       imageTaskMode = parsed.image_task_mode === 'sync' ? 'sync' : 'async'
+      imageURLSourcePrefix = parsed.image_url_source_prefix || ''
+      imageURLTargetPrefix = parsed.image_url_target_prefix || ''
       upstreamModelUpdateCheckEnabled =
         parsed.upstream_model_update_check_enabled === true
       upstreamModelUpdateAutoSyncEnabled =
@@ -530,6 +582,8 @@ export function transformChannelToFormDefaults(
     claude_beta_query: claudeBetaQuery,
     disable_task_polling_sleep: disableTaskPollingSleep,
     image_task_mode: imageTaskMode,
+    image_url_source_prefix: imageURLSourcePrefix,
+    image_url_target_prefix: imageURLTargetPrefix,
     allow_safety_identifier: allowSafetyIdentifier,
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
@@ -649,6 +703,16 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.image_task_mode = 'sync'
   } else if ('image_task_mode' in settingsObj) {
     delete settingsObj.image_task_mode
+  }
+
+  const imageURLSourcePrefix = formData.image_url_source_prefix?.trim() || ''
+  const imageURLTargetPrefix = formData.image_url_target_prefix?.trim() || ''
+  if (imageURLSourcePrefix && imageURLTargetPrefix) {
+    settingsObj.image_url_source_prefix = imageURLSourcePrefix
+    settingsObj.image_url_target_prefix = imageURLTargetPrefix
+  } else {
+    delete settingsObj.image_url_source_prefix
+    delete settingsObj.image_url_target_prefix
   }
 
   // Upstream model update settings (for model-fetchable channel types)

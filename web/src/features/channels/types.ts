@@ -90,6 +90,8 @@ export interface ChannelSettings {
 
 export interface ChannelOtherSettings {
   image_task_mode?: 'async' | 'sync'
+  image_url_source_prefix?: string
+  image_url_target_prefix?: string
   azure_responses_version?: string
   vertex_key_type?: 'json' | 'api_key'
   openrouter_enterprise?: boolean

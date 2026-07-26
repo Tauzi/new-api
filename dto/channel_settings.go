@@ -35,6 +35,8 @@ const (
 
 type ChannelOtherSettings struct {
 	ImageTaskMode                         string                `json:"image_task_mode,omitempty"` // "async" uses upstream task polling; "sync" runs the upstream image request in NewAPI's task worker
+	ImageURLSourcePrefix                  string                `json:"image_url_source_prefix,omitempty"`
+	ImageURLTargetPrefix                  string                `json:"image_url_target_prefix,omitempty"`
 	AzureResponsesVersion                 string                `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType         `json:"vertex_key_type,omitempty"` // "json" or "api_key"
 	OpenRouterEnterprise                  *bool                 `json:"openrouter_enterprise,omitempty"`
@@ -61,6 +63,21 @@ func (s ChannelOtherSettings) GetImageTaskMode() string {
 		return constant.TaskImageUpstreamModeSync
 	}
 	return constant.TaskImageUpstreamModeAsync
+}
+
+func (s ChannelOtherSettings) RewriteImageURL(imageURL string) string {
+	sourcePrefix := strings.TrimRight(strings.TrimSpace(s.ImageURLSourcePrefix), "/")
+	targetPrefix := strings.TrimRight(strings.TrimSpace(s.ImageURLTargetPrefix), "/")
+	if sourcePrefix == "" || targetPrefix == "" {
+		return imageURL
+	}
+	if imageURL == sourcePrefix {
+		return targetPrefix
+	}
+	if !strings.HasPrefix(imageURL, sourcePrefix+"/") {
+		return imageURL
+	}
+	return targetPrefix + strings.TrimPrefix(imageURL, sourcePrefix)
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {

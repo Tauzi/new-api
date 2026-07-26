@@ -658,6 +658,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if err != nil {
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
 	}
+	isImageTask := task.Action == constant.TaskActionImageGenerate || task.Action == constant.TaskActionImageEdit
+	if isImageTask {
+		responseBody, err = RewriteImageResponseURLs(responseBody, ch.GetOtherSettings())
+		if err != nil {
+			return fmt.Errorf("rewrite image task response URLs for task %s: %w", taskId, err)
+		}
+	}
 
 	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
 
@@ -726,7 +733,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if task.FinishTime == 0 {
 			task.FinishTime = now
 		}
-		isImageTask := task.Action == constant.TaskActionImageGenerate || task.Action == constant.TaskActionImageEdit
 		if strings.HasPrefix(taskResult.Url, "data:") && !isImageTask {
 			// data: URI (e.g. Vertex base64 encoded video) — keep in Data, not in ResultURL
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)

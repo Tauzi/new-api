@@ -209,17 +209,35 @@ func TestSystemTaskClaimPassDispatchesEarliestPendingByType(t *testing.T) {
 
 func TestEnqueueSystemTaskReportsCreatedAndExistingActive(t *testing.T) {
 	truncate(t)
+drainWakeups:
+	for {
+		select {
+		case <-systemTaskWakeup:
+		default:
+			break drainWakeups
+		}
+	}
 
 	first, created, err := EnqueueSystemTask("test_enqueue", map[string]bool{"manual": true})
 	require.NoError(t, err)
 	require.True(t, created)
 	require.NotNil(t, first)
+	select {
+	case <-systemTaskWakeup:
+	default:
+		t.Fatal("new system task did not wake the runner")
+	}
 
 	existing, created, err := EnqueueSystemTask("test_enqueue", nil)
 	require.NoError(t, err)
 	require.False(t, created)
 	require.NotNil(t, existing)
 	assert.Equal(t, first.TaskID, existing.TaskID)
+	select {
+	case <-systemTaskWakeup:
+	default:
+		t.Fatal("existing active system task did not wake the runner")
+	}
 
 	_, claimed, err := model.ClaimSystemTask(first.ID, first.Type, "runner-a", common.GetTimestamp()+60)
 	require.NoError(t, err)
@@ -231,4 +249,9 @@ func TestEnqueueSystemTaskReportsCreatedAndExistingActive(t *testing.T) {
 	require.True(t, created)
 	require.NotNil(t, second)
 	assert.NotEqual(t, first.TaskID, second.TaskID)
+	select {
+	case <-systemTaskWakeup:
+	default:
+		t.Fatal("second system task did not wake the runner")
+	}
 }

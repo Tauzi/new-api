@@ -4217,6 +4217,49 @@ export function ChannelMutateDrawer({
                                   </FormItem>
                                 )}
                               />
+
+                              <FormField
+                                control={form.control}
+                                name='image_url_source_prefix'
+                                render={({ field }) => (
+                                  <FormItem className='space-y-2 px-4 py-3'>
+                                    <FormLabel>
+                                      {t('Image URL source prefix')}
+                                    </FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder='https://ig.kcai.asia'
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+
+                              <FormField
+                                control={form.control}
+                                name='image_url_target_prefix'
+                                render={({ field }) => (
+                                  <FormItem className='space-y-2 px-4 py-3'>
+                                    <FormLabel>
+                                      {t('Image URL target prefix')}
+                                    </FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        placeholder='https://mianyunai.com'
+                                        {...field}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Replaces matching prefixes in image result URLs. Leave both fields empty to disable.'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
                             </div>
 
                             <FormField

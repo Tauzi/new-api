@@ -317,6 +317,10 @@ func (a *TaskAdaptor) ExecuteLocalTask(ctx context.Context, task *model.Task, ch
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, responseBody, fmt.Errorf("upstream image request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
+	responseBody, err = service.RewriteImageResponseURLs(responseBody, ch.GetOtherSettings())
+	if err != nil {
+		return nil, responseBody, fmt.Errorf("rewrite synchronous image response URLs: %w", err)
+	}
 
 	var response imageTaskResponse
 	if err := common.Unmarshal(responseBody, &response); err != nil {

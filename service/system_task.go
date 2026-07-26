@@ -204,6 +204,7 @@ func EnqueueSystemTask(taskType string, payload any) (*model.SystemTask, bool, e
 		return nil, false, err
 	}
 	if activeTask != nil {
+		notifySystemTaskRunner()
 		return activeTask, false, nil
 	}
 

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/gin-gonic/gin"
@@ -33,6 +34,21 @@ func newImageTestContext(t *testing.T, body, contentType string, isStream bool) 
 		IsStream:    isStream,
 	}
 	return c, recorder, resp, info
+}
+
+func TestOpenaiImageHandlerRewritesConfiguredURLPrefix(t *testing.T) {
+	body := `{"created":1710000000,"data":[{"url":"https://ig.kcai.asia/generated/result.png"}]}`
+	c, recorder, resp, info := newImageTestContext(t, body, "application/json", false)
+	info.ChannelOtherSettings = dto.ChannelOtherSettings{
+		ImageURLSourcePrefix: "https://ig.kcai.asia",
+		ImageURLTargetPrefix: "https://mianyunai.com",
+	}
+
+	usage, err := OpenaiImageHandler(c, info, resp)
+	require.Nil(t, err)
+	require.NotNil(t, usage)
+	require.Contains(t, recorder.Body.String(), `"url":"https://mianyunai.com/generated/result.png"`)
+	require.NotContains(t, recorder.Body.String(), "ig.kcai.asia")
 }
 
 func TestOpenaiImageDoResponseUsesInfoIsStream(t *testing.T) {

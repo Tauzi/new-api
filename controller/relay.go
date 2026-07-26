@@ -619,6 +619,12 @@ func RelayTask(c *gin.Context) {
 		task.Action = relayInfo.Action
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
+		} else if result.Platform == constant.TaskPlatformAsyncImage && constant.UpdateTask {
+			gopool.Go(func() {
+				if _, _, enqueueErr := service.EnqueueSystemTask(model.SystemTaskTypeAsyncTaskPoll, nil); enqueueErr != nil {
+					common.SysError("enqueue image task polling error: " + enqueueErr.Error())
+				}
+			})
 		}
 	}
 

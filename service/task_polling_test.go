@@ -37,6 +37,44 @@ type localTaskExecutorAdaptor struct {
 	calls int
 }
 
+type completedImagePollingAdaptor struct{}
+
+func (a *completedImagePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a *completedImagePollingAdaptor) FetchTask(_ string, _ string, _ map[string]any, _ string) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(bytes.NewBufferString(`{
+			"id":"upstream_image",
+			"status":"completed",
+			"progress":"100%",
+			"data":[{"url":"https://ig.kcai.asia/generated/async.png"}]
+		}`)),
+	}, nil
+}
+
+func (a *completedImagePollingAdaptor) ParseTaskResult(body []byte) (*relaycommon.TaskInfo, error) {
+	var response struct {
+		ID       string          `json:"id"`
+		Status   string          `json:"status"`
+		Progress string          `json:"progress"`
+		Data     []dto.ImageData `json:"data"`
+	}
+	if err := common.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+	return &relaycommon.TaskInfo{
+		TaskID:   response.ID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: response.Progress,
+		Url:      response.Data[0].Url,
+	}, nil
+}
+
+func (a *completedImagePollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
 func (a *localTaskExecutorAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *localTaskExecutorAdaptor) FetchTask(_ string, _ string, _ map[string]any, _ string) (*http.Response, error) {
@@ -225,6 +263,59 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	assert.Equal(t, "100%", task.Progress)
 	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
 	assert.Empty(t, task.PrivateData.RequestBody)
+}
+
+func TestUpdateVideoTasksRewritesAsynchronousImageResultURL(t *testing.T) {
+	truncate(t)
+	const channelID = 602
+	baseURL := "https://upstream.example.com"
+	channel := &model.Channel{
+		Id:      channelID,
+		Type:    constant.ChannelTypeOpenAI,
+		Name:    "async_image_channel",
+		Key:     "sk-test",
+		Status:  common.ChannelStatusEnabled,
+		BaseURL: &baseURL,
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{
+		DisableTaskPollingSleep: true,
+		ImageURLSourcePrefix:    "https://ig.kcai.asia",
+		ImageURLTargetPrefix:    "https://mianyunai.com",
+	})
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	task := &model.Task{
+		TaskID:    "task_async_image",
+		Platform:  constant.TaskPlatformAsyncImage,
+		UserId:    1,
+		ChannelId: channelID,
+		Action:    constant.TaskActionImageGenerate,
+		Status:    model.TaskStatusQueued,
+		Progress:  "10%",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamTaskID: "upstream_image",
+			UpstreamMode:   constant.TaskImageUpstreamModeAsync,
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	adaptor := &completedImagePollingAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatformAsyncImage, map[int][]string{
+		channelID: {task.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	}))
+
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	assert.Equal(t, "https://mianyunai.com/generated/async.png", task.PrivateData.ResultURL)
+	assert.Contains(t, string(task.Data), "https://mianyunai.com/generated/async.png")
+	assert.NotContains(t, string(task.Data), "ig.kcai.asia")
 }
 
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {

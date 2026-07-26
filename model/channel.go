@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -969,6 +970,25 @@ func (channel *Channel) ValidateSettings() error {
 	if channelOtherSettings.AdvancedCustom != nil {
 		if err := channelOtherSettings.AdvancedCustom.Validate(); err != nil {
 			return err
+		}
+	}
+	imageURLPrefixes := []struct {
+		name  string
+		value string
+	}{
+		{name: "image_url_source_prefix", value: strings.TrimSpace(channelOtherSettings.ImageURLSourcePrefix)},
+		{name: "image_url_target_prefix", value: strings.TrimSpace(channelOtherSettings.ImageURLTargetPrefix)},
+	}
+	if (imageURLPrefixes[0].value == "") != (imageURLPrefixes[1].value == "") {
+		return fmt.Errorf("image_url_source_prefix and image_url_target_prefix must be configured together")
+	}
+	for _, prefix := range imageURLPrefixes {
+		if prefix.value == "" {
+			continue
+		}
+		parsedURL, err := url.Parse(prefix.value)
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" || parsedURL.User != nil || parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
+			return fmt.Errorf("%s must be an absolute HTTP(S) URL without query or fragment", prefix.name)
 		}
 	}
 	if channel.Type == constant.ChannelTypeAdvancedCustom && channelOtherSettings.UpstreamModelUpdateCheckEnabled {

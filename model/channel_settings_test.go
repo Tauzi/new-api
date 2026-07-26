@@ -66,3 +66,54 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 		})
 	}
 }
+
+func TestChannelImageURLReplacementSettingsValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		target  string
+		wantErr string
+	}{
+		{name: "disabled when both prefixes are empty"},
+		{
+			name:   "accepts absolute prefixes with paths",
+			source: "https://upstream.example.com/generated",
+			target: "https://api.example.com/generated",
+		},
+		{
+			name:    "requires both prefixes",
+			source:  "https://upstream.example.com",
+			wantErr: "must be configured together",
+		},
+		{
+			name:    "rejects non HTTP target",
+			source:  "https://upstream.example.com",
+			target:  "ftp://api.example.com",
+			wantErr: "absolute HTTP(S) URL",
+		},
+		{
+			name:    "rejects query in prefix",
+			source:  "https://upstream.example.com?token=secret",
+			target:  "https://api.example.com",
+			wantErr: "without query or fragment",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			channel := &Channel{Type: constant.ChannelTypeOpenAI}
+			channel.SetOtherSettings(dto.ChannelOtherSettings{
+				ImageURLSourcePrefix: tt.source,
+				ImageURLTargetPrefix: tt.target,
+			})
+
+			err := channel.ValidateSettings()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}

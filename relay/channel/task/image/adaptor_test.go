@@ -126,12 +126,17 @@ func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
 	}
 	channelBaseURL := server.URL
 	ch := &model.Channel{BaseURL: &channelBaseURL, Key: "secret"}
+	ch.SetOtherSettings(dto.ChannelOtherSettings{
+		ImageURLSourcePrefix: "https://example.com",
+		ImageURLTargetPrefix: "https://images.example.net",
+	})
 
 	result, responseBody, err := (&TaskAdaptor{}).ExecuteLocalTask(context.Background(), task, ch)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, string(model.TaskStatusSuccess), result.Status)
-	assert.Equal(t, "https://example.com/result.png", result.Url)
+	assert.Equal(t, "https://images.example.net/result.png", result.Url)
+	assert.Contains(t, string(responseBody), "https://images.example.net/result.png")
 	assert.Contains(t, string(responseBody), "result.png")
 }
 
