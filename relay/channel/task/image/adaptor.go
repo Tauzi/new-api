@@ -54,6 +54,16 @@ type imageTaskError struct {
 	Code    string `json:"code"`
 }
 
+type retryableSynchronousImageError struct {
+	err error
+}
+
+func (e *retryableSynchronousImageError) Error() string { return e.err.Error() }
+
+func (e *retryableSynchronousImageError) Unwrap() error { return e.err }
+
+func (e *retryableSynchronousImageError) Retryable() bool { return true }
+
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	if info == nil || info.ChannelMeta == nil {
 		return
@@ -307,15 +317,19 @@ func (a *TaskAdaptor) ExecuteLocalTask(ctx context.Context, task *model.Task, ch
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &retryableSynchronousImageError{err: err}
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &retryableSynchronousImageError{err: err}
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, responseBody, fmt.Errorf("upstream image request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		statusErr := fmt.Errorf("upstream image request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+			return nil, responseBody, &retryableSynchronousImageError{err: statusErr}
+		}
+		return nil, responseBody, statusErr
 	}
 	responseBody, err = service.RewriteImageResponseURLs(responseBody, ch.GetOtherSettings())
 	if err != nil {

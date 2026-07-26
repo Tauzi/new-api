@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	stdimage "image"
 	"image/color"
 	"image/png"
@@ -138,6 +139,45 @@ func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
 	assert.Equal(t, "https://images.example.net/result.png", result.Url)
 	assert.Contains(t, string(responseBody), "https://images.example.net/result.png")
 	assert.Contains(t, string(responseBody), "result.png")
+}
+
+func TestExecuteLocalTaskMarksRetryableHTTPStatuses(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		retryable bool
+	}{
+		{name: "bad request is terminal", status: http.StatusBadRequest},
+		{name: "rate limit is retryable", status: http.StatusTooManyRequests, retryable: true},
+		{name: "server error is retryable", status: http.StatusInternalServerError, retryable: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream failed"}}`))
+			}))
+			t.Cleanup(server.Close)
+
+			task := &model.Task{
+				TaskID: "task_retryable_status",
+				Action: constant.TaskActionImageGenerate,
+				PrivateData: model.TaskPrivateData{
+					RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+					RequestContentType: "application/json",
+				},
+			}
+			baseURL := server.URL
+			ch := &model.Channel{BaseURL: &baseURL, Key: "secret"}
+
+			_, _, err := (&TaskAdaptor{}).ExecuteLocalTask(context.Background(), task, ch)
+			require.Error(t, err)
+			var retryableError interface{ Retryable() bool }
+			markedRetryable := errors.As(err, &retryableError) && retryableError.Retryable()
+			assert.Equal(t, tt.retryable, markedRetryable)
+		})
+	}
 }
 
 func TestValidateRequestAllowsModelSpecificSize(t *testing.T) {

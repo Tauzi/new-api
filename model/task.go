@@ -106,6 +106,7 @@ type TaskPrivateData struct {
 	UpstreamMode       string `json:"upstream_mode,omitempty"`    // "async" uses provider task polling; "sync" runs a local worker
 	RequestBody        []byte `json:"request_body,omitempty"`     // persisted local-sync request body (JSON base64 or multipart bytes)
 	RequestContentType string `json:"request_content_type,omitempty"`
+	LocalTaskAttempts  int    `json:"local_task_attempts,omitempty"`
 	ResultURL          string `json:"result_url,omitempty"` // 任务成功后的结果 URL（视频地址等）
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
@@ -162,7 +163,7 @@ func (p *TaskPrivateData) Scan(val interface{}) error {
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if p.Key == "" && p.UpstreamTaskID == "" && p.UpstreamMode == "" &&
-		len(p.RequestBody) == 0 && p.RequestContentType == "" &&
+		len(p.RequestBody) == 0 && p.RequestContentType == "" && p.LocalTaskAttempts == 0 &&
 		p.ResultURL == "" && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil {
 		return nil, nil

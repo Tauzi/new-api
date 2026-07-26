@@ -37,6 +37,12 @@ type localTaskExecutorAdaptor struct {
 	calls int
 }
 
+type timeoutThenSuccessLocalTaskExecutor struct {
+	localTaskExecutorAdaptor
+	timeoutFailures int
+	deadlines       []time.Duration
+}
+
 type completedImagePollingAdaptor struct{}
 
 func (a *completedImagePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -97,6 +103,22 @@ func (a *localTaskExecutorAdaptor) ExecuteLocalTask(_ context.Context, task *mod
 		Progress: "100%",
 		Url:      "https://example.com/local.png",
 	}, []byte(`{"data":[{"url":"https://example.com/local.png"}]}`), nil
+}
+
+func (a *timeoutThenSuccessLocalTaskExecutor) ExecuteLocalTask(ctx context.Context, task *model.Task, _ *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
+	a.calls++
+	if deadline, ok := ctx.Deadline(); ok {
+		a.deadlines = append(a.deadlines, time.Until(deadline))
+	}
+	if a.calls <= a.timeoutFailures {
+		return nil, nil, context.DeadlineExceeded
+	}
+	return &relaycommon.TaskInfo{
+		TaskID:   task.TaskID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: "100%",
+		Url:      "https://example.com/retried.png",
+	}, []byte(`{"data":[{"url":"https://example.com/retried.png"}]}`), nil
 }
 
 func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -263,6 +285,91 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	assert.Equal(t, "100%", task.Progress)
 	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
 	assert.Empty(t, task.PrivateData.RequestBody)
+}
+
+func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {
+	truncate(t)
+	const channelID = 603
+	seedTaskPollingChannel(t, channelID, true)
+	task := &model.Task{
+		TaskID:    "task_local_sync_retry",
+		Platform:  constant.TaskPlatformAsyncImage,
+		UserId:    1,
+		ChannelId: channelID,
+		Action:    constant.TaskActionImageGenerate,
+		Status:    model.TaskStatusQueued,
+		Progress:  "10%",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+			RequestContentType: "application/json",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	executor := &timeoutThenSuccessLocalTaskExecutor{timeoutFailures: 1}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return executor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	assert.Equal(t, 2, executor.calls)
+	require.Len(t, executor.deadlines, 2)
+	for _, remaining := range executor.deadlines {
+		assert.Greater(t, remaining, 299*time.Second)
+		assert.LessOrEqual(t, remaining, 300*time.Second)
+	}
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	assert.Equal(t, 2, task.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, "https://example.com/retried.png", task.PrivateData.ResultURL)
+	assert.Empty(t, task.PrivateData.RequestBody)
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, 2, persisted.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+}
+
+func TestUpdateLocalTasksStopsAfterOneSynchronousImageRetry(t *testing.T) {
+	truncate(t)
+	const channelID = 604
+	seedTaskPollingChannel(t, channelID, true)
+	task := &model.Task{
+		TaskID:    "task_local_sync_retry_exhausted",
+		Platform:  constant.TaskPlatformAsyncImage,
+		UserId:    1,
+		ChannelId: channelID,
+		Action:    constant.TaskActionImageGenerate,
+		Status:    model.TaskStatusQueued,
+		Progress:  "10%",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+		PrivateData: model.TaskPrivateData{
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+			RequestContentType: "application/json",
+		},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	executor := &timeoutThenSuccessLocalTaskExecutor{timeoutFailures: 2}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return executor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	assert.Equal(t, 2, executor.calls)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+	assert.Equal(t, 2, task.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, "synchronous image upstream timed out after 300 seconds", task.FailReason)
+	assert.Empty(t, task.PrivateData.RequestBody)
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, 2, persisted.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
 }
 
 func TestUpdateVideoTasksRewritesAsynchronousImageResultURL(t *testing.T) {
