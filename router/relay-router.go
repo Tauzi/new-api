@@ -66,6 +66,14 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		playgroundRouter.POST("/chat/completions", controller.Playground)
 	}
+	imageTaskRouter := router.Group("/v1/images")
+	imageTaskRouter.Use(middleware.RouteTag("relay"))
+	imageTaskRouter.Use(middleware.SystemPerformanceCheck())
+	imageTaskRouter.Use(middleware.GlobalAPIRateLimit())
+	{
+		imageTaskRouter.GET("/generations/:task_id", controller.RelayImageTaskFetch)
+		imageTaskRouter.GET("/edits/:task_id", controller.RelayImageTaskFetch)
+	}
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
@@ -117,11 +125,9 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/images/generations", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIImage)
 		})
-		httpRouter.GET("/images/generations/:task_id", controller.RelayTaskFetch)
 		httpRouter.POST("/images/edits", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIImage)
 		})
-		httpRouter.GET("/images/edits/:task_id", controller.RelayTaskFetch)
 
 		// embedding related routes
 		httpRouter.POST("/embeddings", func(c *gin.Context) {

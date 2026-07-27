@@ -443,8 +443,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 
 func imageFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dto.TaskError) {
 	taskID := c.Param("task_id")
-	userID := c.GetInt("id")
-	originTask, exists, err := model.GetByTaskId(userID, taskID)
+	originTask, exists, err := model.GetImageTaskByTaskId(taskID)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
 	}

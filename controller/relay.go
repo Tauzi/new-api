@@ -495,6 +495,13 @@ func RelayTaskFetch(c *gin.Context) {
 	}
 }
 
+func RelayImageTaskFetch(c *gin.Context) {
+	relayMode := relayconstant.Path2RelayMode(c.Request.URL.Path)
+	if taskErr := relay.RelayTaskFetch(c, relayMode); taskErr != nil {
+		respondTaskError(c, taskErr)
+	}
+}
+
 func RelayTask(c *gin.Context) {
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
