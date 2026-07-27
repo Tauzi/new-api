@@ -49,6 +49,20 @@ const (
 	synchronousImageTaskMaxAttempts = 2
 )
 
+var synchronousImageTaskSlotsOnce sync.Once
+var synchronousImageTaskSlotPool chan struct{}
+
+func synchronousImageTaskSlots() chan struct{} {
+	synchronousImageTaskSlotsOnce.Do(func() {
+		limit := constant.AsyncImageWorkerSlots
+		if limit <= 0 {
+			limit = constant.DefaultAsyncImageWorkerSlots
+		}
+		synchronousImageTaskSlotPool = make(chan struct{}, limit)
+	})
+	return synchronousImageTaskSlotPool
+}
+
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
 // 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
@@ -218,18 +232,89 @@ func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks
 	if !ok {
 		return fmt.Errorf("platform %s does not support local task execution", platform)
 	}
-	for _, task := range tasks {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	if platform != constant.TaskPlatformAsyncImage {
+		for _, task := range tasks {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if task == nil || task.Status == model.TaskStatusInProgress {
+				continue
+			}
+			if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
+			}
 		}
+		return nil
+	}
+
+	slots := synchronousImageTaskSlots()
+	var wg sync.WaitGroup
+	for _, task := range tasks {
 		if task == nil || task.Status == model.TaskStatusInProgress {
 			continue
 		}
+		if task.Platform != constant.TaskPlatformAsyncImage ||
+			task.PrivateData.UpstreamMode != constant.TaskImageUpstreamModeSync {
+			if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
+			}
+			continue
+		}
+		task := task
+		select {
+		case slots <- struct{}{}:
+			wg.Add(1)
+			gopool.Go(func() {
+				defer wg.Done()
+				defer func() { <-slots }()
+				if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
+					logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
+				}
+			})
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// TryDispatchLocalTask starts a newly persisted synchronous image task when a
+// worker slot is available. Tasks beyond the process-wide limit remain queued
+// for the persistent task runner, which uses the same slots.
+func TryDispatchLocalTask(task *model.Task) bool {
+	if task == nil || task.Platform != constant.TaskPlatformAsyncImage ||
+		task.PrivateData.UpstreamMode != constant.TaskImageUpstreamModeSync ||
+		len(task.PrivateData.RequestBody) == 0 || GetTaskAdaptorFunc == nil {
+		return false
+	}
+	adaptor := GetTaskAdaptorFunc(task.Platform)
+	if adaptor == nil {
+		return false
+	}
+	executor, ok := adaptor.(LocalTaskExecutor)
+	if !ok {
+		return false
+	}
+	slots := synchronousImageTaskSlots()
+	select {
+	case slots <- struct{}{}:
+	default:
+		return false
+	}
+
+	gopool.Go(func() {
+		defer func() { <-slots }()
+		ctx := context.Background()
 		if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
 		}
-	}
-	return nil
+	})
+	return true
 }
 
 func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, executor LocalTaskExecutor, task *model.Task) error {

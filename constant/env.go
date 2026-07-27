@@ -1,5 +1,7 @@
 package constant
 
+const DefaultAsyncImageWorkerSlots = 50
+
 var StreamingTimeout int
 var DifyDebug bool
 var MaxFileDownloadMB int
@@ -18,6 +20,7 @@ var GenerateDefaultToken bool
 var ErrorLogEnabled bool
 var TaskQueryLimit int
 var TaskTimeoutMinutes int
+var AsyncImageWorkerSlots int
 
 // temporary variable for sora patch, will be removed in future
 var TaskPricePatches []string

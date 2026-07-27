@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -41,6 +42,15 @@ type timeoutThenSuccessLocalTaskExecutor struct {
 	localTaskExecutorAdaptor
 	timeoutFailures int
 	deadlines       []time.Duration
+}
+
+type blockingLocalTaskExecutor struct {
+	localTaskExecutorAdaptor
+	mu        sync.Mutex
+	started   chan string
+	release   chan struct{}
+	active    int
+	maxActive int
 }
 
 type completedImagePollingAdaptor struct{}
@@ -119,6 +129,34 @@ func (a *timeoutThenSuccessLocalTaskExecutor) ExecuteLocalTask(ctx context.Conte
 		Progress: "100%",
 		Url:      "https://example.com/retried.png",
 	}, []byte(`{"data":[{"url":"https://example.com/retried.png"}]}`), nil
+}
+
+func (a *blockingLocalTaskExecutor) ExecuteLocalTask(_ context.Context, task *model.Task, _ *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
+	a.mu.Lock()
+	a.active++
+	if a.active > a.maxActive {
+		a.maxActive = a.active
+	}
+	a.mu.Unlock()
+
+	a.started <- task.TaskID
+	<-a.release
+
+	a.mu.Lock()
+	a.active--
+	a.mu.Unlock()
+	return &relaycommon.TaskInfo{
+		TaskID:   task.TaskID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: "100%",
+		Url:      "https://example.com/concurrent.png",
+	}, []byte(`{"data":[{"url":"https://example.com/concurrent.png"}]}`), nil
+}
+
+func (a *blockingLocalTaskExecutor) maxConcurrency() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.maxActive
 }
 
 func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
@@ -285,6 +323,84 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	assert.Equal(t, "100%", task.Progress)
 	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
 	assert.Empty(t, task.PrivateData.RequestBody)
+}
+
+func TestSynchronousImageConcurrencyUsesGlobalConfigurableSlots(t *testing.T) {
+	truncate(t)
+	const firstChannelID = 605
+	const secondChannelID = 606
+	seedTaskPollingChannel(t, firstChannelID, true)
+	seedTaskPollingChannel(t, secondChannelID, true)
+	previousSlots := constant.AsyncImageWorkerSlots
+	constant.AsyncImageWorkerSlots = 3
+	synchronousImageTaskSlotsOnce = sync.Once{}
+	synchronousImageTaskSlotPool = nil
+	t.Cleanup(func() {
+		constant.AsyncImageWorkerSlots = previousSlots
+		synchronousImageTaskSlotsOnce = sync.Once{}
+		synchronousImageTaskSlotPool = nil
+	})
+
+	newTask := func(id string, channelID int) *model.Task {
+		task := &model.Task{
+			TaskID:    id,
+			Platform:  constant.TaskPlatformAsyncImage,
+			UserId:    1,
+			ChannelId: channelID,
+			Action:    constant.TaskActionImageGenerate,
+			Status:    model.TaskStatusQueued,
+			Progress:  "10%",
+			CreatedAt: time.Now().Unix(),
+			UpdatedAt: time.Now().Unix(),
+			PrivateData: model.TaskPrivateData{
+				UpstreamMode:       constant.TaskImageUpstreamModeSync,
+				RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+				RequestContentType: "application/json",
+			},
+		}
+		require.NoError(t, model.DB.Create(task).Error)
+		return task
+	}
+
+	channelIDs := []int{firstChannelID, secondChannelID, firstChannelID, secondChannelID}
+	tasks := make([]*model.Task, 0, len(channelIDs))
+	for i, channelID := range channelIDs {
+		tasks = append(tasks, newTask(fmt.Sprintf("task_global_slot_%d", i), channelID))
+	}
+	executor := &blockingLocalTaskExecutor{
+		started: make(chan string, len(tasks)),
+		release: make(chan struct{}),
+	}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return executor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	for i, task := range tasks {
+		started := TryDispatchLocalTask(task)
+		assert.Equal(t, i < 3, started)
+	}
+
+	startedIDs := make(map[string]struct{}, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case taskID := <-executor.started:
+			startedIDs[taskID] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent image tasks did not start")
+		}
+	}
+	assert.NotContains(t, startedIDs, tasks[3].TaskID)
+	assert.Equal(t, 3, executor.maxConcurrency())
+	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), tasks[3].Status)
+
+	close(executor.release)
+	require.Eventually(t, func() bool {
+		return len(synchronousImageTaskSlots()) == 0
+	}, 2*time.Second, 10*time.Millisecond)
+	require.True(t, TryDispatchLocalTask(tasks[3]))
+	require.Eventually(t, func() bool {
+		return tasks[3].Status == model.TaskStatusSuccess
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {

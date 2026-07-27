@@ -629,6 +629,9 @@ func RelayTask(c *gin.Context) {
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
 		} else if result.Platform == constant.TaskPlatformAsyncImage && constant.UpdateTask {
+			if result.LocalTaskData != nil {
+				service.TryDispatchLocalTask(task)
+			}
 			gopool.Go(func() {
 				if _, _, enqueueErr := service.EnqueueSystemTask(model.SystemTaskTypeAsyncTaskPoll, nil); enqueueErr != nil {
 					common.SysError("enqueue image task polling error: " + enqueueErr.Error())
