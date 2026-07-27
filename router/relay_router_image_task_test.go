@@ -48,6 +48,14 @@ func TestImageTaskFetchIsPublicAndImageOnly(t *testing.T) {
 		Status:   model.TaskStatusSuccess,
 		Progress: "100%",
 	}).Error)
+	require.NoError(t, db.Create(&model.Task{
+		TaskID:   "task_image_unknown_action",
+		UserId:   42,
+		Platform: constant.TaskPlatformAsyncImage,
+		Status:   model.TaskStatusSuccess,
+		Progress: "100%",
+		Data:     data,
+	}).Error)
 
 	engine := gin.New()
 	SetRelayRouter(engine)
@@ -72,5 +80,17 @@ func TestImageTaskFetchIsPublicAndImageOnly(t *testing.T) {
 		engine.ServeHTTP(recorder, request)
 
 		assert.Equal(t, http.StatusNotFound, recorder.Code)
+	})
+
+	t.Run("fetches legacy image task without a recognized action", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/v1/images/edits/task_image_unknown_action", nil)
+		engine.ServeHTTP(recorder, request)
+
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var response dto.OpenAIImageTask
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		assert.Equal(t, "task_image_unknown_action", response.ID)
+		assert.Equal(t, dto.ImageTaskStatusCompleted, response.Status)
 	})
 }

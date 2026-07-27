@@ -450,12 +450,6 @@ func imageFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	if !exists || originTask == nil {
 		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
 	}
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits/") && originTask.Action != constant.TaskActionImageEdit {
-		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
-	}
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations/") && originTask.Action != constant.TaskActionImageGenerate {
-		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
-	}
 
 	imageTask := dto.OpenAIImageTask{
 		ID:        originTask.TaskID,
