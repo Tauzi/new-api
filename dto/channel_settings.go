@@ -131,6 +131,7 @@ const (
 	advancedCustomEndpointPathOpenAIChat             = "/v1/chat/completions"
 	advancedCustomEndpointPathOpenAIResponses        = "/v1/responses"
 	advancedCustomEndpointPathOpenAIResponsesCompact = "/v1/responses/compact"
+	advancedCustomEndpointPathOpenAIAlphaSearch      = "/v1/alpha/search"
 	advancedCustomEndpointPathClaudeMessages         = "/v1/messages"
 	advancedCustomEndpointPathJinaRerank             = "/v1/rerank"
 	advancedCustomEndpointPathImageGeneration        = "/v1/images/generations"
@@ -229,6 +230,8 @@ func advancedCustomEndpointTypeFromIncomingPath(incomingPath string) (constant.E
 		return constant.EndpointTypeOpenAIResponse, true
 	case advancedCustomEndpointPathOpenAIResponsesCompact:
 		return constant.EndpointTypeOpenAIResponseCompact, true
+	case advancedCustomEndpointPathOpenAIAlphaSearch:
+		return constant.EndpointTypeOpenAIAlphaSearch, true
 	case advancedCustomEndpointPathClaudeMessages:
 		return constant.EndpointTypeAnthropic, true
 	case advancedCustomEndpointPathJinaRerank:
@@ -500,6 +503,12 @@ func validateAdvancedCustomUpstreamTarget(index int, upstreamPath string) error 
 }
 
 func validateAdvancedCustomConverterPath(index int, incomingPath string, converter string) error {
+	if incomingPath == advancedCustomEndpointPathOpenAIAlphaSearch {
+		if converter == advancedCustomConverterNone {
+			return nil
+		}
+		return fmt.Errorf("advanced_custom.advanced_routes[%d].converter does not match incoming_path: %s", index, converter)
+	}
 	switch converter {
 	case advancedCustomConverterNone:
 		return nil
