@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	stdimage "image"
 	"image/color"
 	"image/png"
@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,13 @@ import (
 )
 
 const testModel = "gpt-image-2-4k-async"
+
+func useTestImageQueue(t *testing.T) {
+	t.Helper()
+	previous := constant.AsyncImageQueueDir
+	constant.AsyncImageQueueDir = t.TempDir()
+	t.Cleanup(func() { constant.AsyncImageQueueDir = previous })
+}
 
 func newJSONContext(t *testing.T, body string) *gin.Context {
 	t.Helper()
@@ -77,6 +85,7 @@ func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 }
 
 func TestPrepareLocalTaskUsesSynchronousUpstreamMode(t *testing.T) {
+	useTestImageQueue(t)
 	c := newJSONContext(t, `{
 		"async": true,
 		"model": "vendor-image-sync",
@@ -99,15 +108,26 @@ func TestPrepareLocalTaskUsesSynchronousUpstreamMode(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, isLocal)
 	require.NotNil(t, localData)
+	assert.NotEmpty(t, localData.PayloadFile)
+	assert.False(t, c.Writer.Written())
 
+	payload, err := service.OpenAsyncImagePayload(localData.PayloadFile)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = payload.Close()
+		_ = service.RemoveAsyncImagePayload(localData.PayloadFile)
+	})
+	requestBody, err := io.ReadAll(payload)
+	require.NoError(t, err)
 	var upstreamBody map[string]any
-	require.NoError(t, common.Unmarshal(localData.RequestBody, &upstreamBody))
+	require.NoError(t, common.Unmarshal(requestBody, &upstreamBody))
 	assert.Equal(t, "vendor-image-sync", upstreamBody["model"])
 	assert.Equal(t, "2048x2048", upstreamBody["size"])
 	assert.NotContains(t, upstreamBody, "async")
 }
 
 func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
+	useTestImageQueue(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/v1/images/generations", r.URL.Path)
@@ -117,11 +137,17 @@ func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
+	payloadFile, err := service.WriteAsyncImagePayload("task_local", func(dst io.Writer) error {
+		_, writeErr := io.WriteString(dst, `{"model":"vendor-image-sync","prompt":"test"}`)
+		return writeErr
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = service.RemoveAsyncImagePayload(payloadFile) })
 	task := &model.Task{
 		TaskID: "task_local",
 		Action: constant.TaskActionImageGenerate,
 		PrivateData: model.TaskPrivateData{
-			RequestBody:        []byte(`{"model":"vendor-image-sync","prompt":"test"}`),
+			RequestPayloadFile: payloadFile,
 			RequestContentType: "application/json",
 		},
 	}
@@ -141,15 +167,14 @@ func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
 	assert.Contains(t, string(responseBody), "result.png")
 }
 
-func TestExecuteLocalTaskMarksRetryableHTTPStatuses(t *testing.T) {
+func TestExecuteLocalTaskReturnsHTTPStatusErrors(t *testing.T) {
 	tests := []struct {
-		name      string
-		status    int
-		retryable bool
+		name   string
+		status int
 	}{
-		{name: "bad request is terminal", status: http.StatusBadRequest},
-		{name: "rate limit is retryable", status: http.StatusTooManyRequests, retryable: true},
-		{name: "server error is retryable", status: http.StatusInternalServerError, retryable: true},
+		{name: "bad request", status: http.StatusBadRequest},
+		{name: "rate limit", status: http.StatusTooManyRequests},
+		{name: "server error", status: http.StatusInternalServerError},
 	}
 
 	for _, tt := range tests {
@@ -173,9 +198,7 @@ func TestExecuteLocalTaskMarksRetryableHTTPStatuses(t *testing.T) {
 
 			_, _, err := (&TaskAdaptor{}).ExecuteLocalTask(context.Background(), task, ch)
 			require.Error(t, err)
-			var retryableError interface{ Retryable() bool }
-			markedRetryable := errors.As(err, &retryableError) && retryableError.Retryable()
-			assert.Equal(t, tt.retryable, markedRetryable)
+			assert.ErrorContains(t, err, fmt.Sprintf("status %d", tt.status))
 		})
 	}
 }
@@ -326,6 +349,57 @@ func TestBuildMultipartBodyPreservesRepeatedImages(t *testing.T) {
 	assert.Equal(t, "true", form.Value["async"][0])
 	assert.Equal(t, "1", form.Value["n"][0])
 	assert.Equal(t, "medium", form.Value["quality"][0])
+	assert.Len(t, form.File["image"], 2)
+}
+
+func TestPrepareLocalMultipartTaskSpoolsRepeatedImages(t *testing.T) {
+	useTestImageQueue(t)
+	var original bytes.Buffer
+	writer := multipart.NewWriter(&original)
+	require.NoError(t, writer.WriteField("model", testModel))
+	require.NoError(t, writer.WriteField("prompt", "edit these images"))
+	require.NoError(t, writer.WriteField("async", "true"))
+	for _, name := range []string{"one.png", "two.png"} {
+		part, err := writer.CreateFormFile("image", name)
+		require.NoError(t, err)
+		_, err = part.Write([]byte("image-data-" + name))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(original.Bytes()))
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesEdits,
+		OriginModelName: testModel,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: testModel,
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				ImageTaskMode: constant.TaskImageUpstreamModeSync,
+			},
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_local_multipart"},
+	}
+	adaptor := &TaskAdaptor{}
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+
+	localData, isLocal, err := adaptor.PrepareLocalTask(c, info)
+	require.NoError(t, err)
+	require.True(t, isLocal)
+	payload, err := service.OpenAsyncImagePayload(localData.PayloadFile)
+	require.NoError(t, err)
+	defer payload.Close()
+	t.Cleanup(func() { _ = service.RemoveAsyncImagePayload(localData.PayloadFile) })
+	_, params, err := mime.ParseMediaType(localData.ContentType)
+	require.NoError(t, err)
+	form, err := multipart.NewReader(payload, params["boundary"]).ReadForm(maxImageBytes)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = form.RemoveAll() })
+
+	assert.Empty(t, form.Value["async"])
+	assert.Equal(t, "1", form.Value["n"][0])
 	assert.Len(t, form.File["image"], 2)
 }
 

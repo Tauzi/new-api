@@ -214,15 +214,15 @@ func TestUpdateWithStatus_Lose(t *testing.T) {
 func TestClaimLocalTaskWithStatusDoesNotRewritePrivateData(t *testing.T) {
 	truncateTables(t)
 
-	originalBody := []byte("large persisted multipart body")
+	const payloadFile = "task_local_claim-123.payload"
 	task := &Task{
 		TaskID:   "task_local_claim",
 		Status:   TaskStatusQueued,
 		Progress: "10%",
 		PrivateData: TaskPrivateData{
-			UpstreamMode:      constant.TaskImageUpstreamModeSync,
-			RequestBody:       originalBody,
-			LocalTaskAttempts: 0,
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestPayloadFile: payloadFile,
+			LocalTaskAttempts:  0,
 		},
 	}
 	insertTask(t, task)
@@ -239,7 +239,7 @@ func TestClaimLocalTaskWithStatusDoesNotRewritePrivateData(t *testing.T) {
 	require.NoError(t, DB.First(&reloaded, task.ID).Error)
 	assert.Equal(t, TaskStatus(TaskStatusInProgress), reloaded.Status)
 	assert.Equal(t, "30%", reloaded.Progress)
-	assert.Equal(t, originalBody, reloaded.PrivateData.RequestBody)
+	assert.Equal(t, payloadFile, reloaded.PrivateData.RequestPayloadFile)
 	assert.Zero(t, reloaded.PrivateData.LocalTaskAttempts)
 }
 
@@ -255,7 +255,7 @@ func TestFailStaleInProgressLocalImageTasks(t *testing.T) {
 		Progress: "50%",
 		PrivateData: TaskPrivateData{
 			UpstreamMode:       constant.TaskImageUpstreamModeSync,
-			RequestBody:        []byte("persisted request"),
+			RequestPayloadFile: "task_stale_local-123.payload",
 			RequestContentType: "multipart/form-data",
 		},
 	}
@@ -268,8 +268,8 @@ func TestFailStaleInProgressLocalImageTasks(t *testing.T) {
 		Status:   TaskStatusInProgress,
 		Progress: "50%",
 		PrivateData: TaskPrivateData{
-			UpstreamMode: constant.TaskImageUpstreamModeSync,
-			RequestBody:  []byte("active request"),
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestPayloadFile: "task_recent_local-123.payload",
 		},
 	}
 	insertTask(t, recentLocal)
@@ -290,18 +290,19 @@ func TestFailStaleInProgressLocalImageTasks(t *testing.T) {
 	failedTasks, err := FailStaleInProgressLocalImageTasks(now-90, 10, reason)
 	require.NoError(t, err)
 	require.Len(t, failedTasks, 1)
-	assert.Equal(t, staleLocal.ID, failedTasks[0].ID)
-	assert.Equal(t, TaskStatus(TaskStatusFailure), failedTasks[0].Status)
-	assert.Equal(t, "100%", failedTasks[0].Progress)
-	assert.Equal(t, reason, failedTasks[0].FailReason)
-	assert.NotZero(t, failedTasks[0].FinishTime)
-	assert.Empty(t, failedTasks[0].PrivateData.RequestBody)
-	assert.Empty(t, failedTasks[0].PrivateData.RequestContentType)
+	assert.Equal(t, staleLocal.ID, failedTasks[0].Task.ID)
+	assert.Equal(t, "task_stale_local-123.payload", failedTasks[0].PayloadFile)
+	assert.Equal(t, TaskStatus(TaskStatusFailure), failedTasks[0].Task.Status)
+	assert.Equal(t, "100%", failedTasks[0].Task.Progress)
+	assert.Equal(t, reason, failedTasks[0].Task.FailReason)
+	assert.NotZero(t, failedTasks[0].Task.FinishTime)
+	assert.Empty(t, failedTasks[0].Task.PrivateData.RequestPayloadFile)
+	assert.Empty(t, failedTasks[0].Task.PrivateData.RequestContentType)
 
 	var recent Task
 	require.NoError(t, DB.First(&recent, recentLocal.ID).Error)
 	assert.Equal(t, TaskStatus(TaskStatusInProgress), recent.Status)
-	assert.Equal(t, []byte("active request"), recent.PrivateData.RequestBody)
+	assert.Equal(t, "task_recent_local-123.payload", recent.PrivateData.RequestPayloadFile)
 
 	var remote Task
 	require.NoError(t, DB.First(&remote, staleRemote.ID).Error)

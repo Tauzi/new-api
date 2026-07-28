@@ -30,6 +30,7 @@ services:
       - SQL_DSN=postgresql://root:123456@postgres:5432/new-api
       - REDIS_CONN_STRING=redis://redis
       - ASYNC_IMAGE_WORKER_SLOTS=${ASYNC_IMAGE_WORKER_SLOTS:-20}
+      - ASYNC_IMAGE_QUEUE_DIR=/data/async-image-queue
       - TZ=Asia/Shanghai
       - BATCH_UPDATE_ENABLED=true
       # Local HTTP dev mode: keep Secure=false and leave TRUSTED_URL unset. This disables the refresh/logout OriginGuard so the :5173 -> :3000 dev proxy works.

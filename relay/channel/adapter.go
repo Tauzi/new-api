@@ -78,16 +78,16 @@ type TaskAdaptor interface {
 	ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error)
 }
 
-// LocalTaskData contains the request that a persisted local task must execute
-// after the submit response has already been returned to the client.
+// LocalTaskData identifies the queued request that a local worker must execute.
 type LocalTaskData struct {
-	RequestBody []byte
+	PayloadFile string
 	ContentType string
 }
 
 // LocalTaskSubmitter is implemented by task adaptors whose upstream is
-// synchronous. The adaptor returns true after writing the queued response and
-// persisting the request payload for the background worker.
+// synchronous. The adaptor returns true after persisting the request payload
+// for the background worker. The controller returns only after the task row is
+// committed, so the public task ID is immediately queryable.
 type LocalTaskSubmitter interface {
 	PrepareLocalTask(c *gin.Context, info *relaycommon.RelayInfo) (*LocalTaskData, bool, error)
 }

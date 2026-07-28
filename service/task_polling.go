@@ -34,8 +34,8 @@ type TaskPollingAdaptor interface {
 }
 
 // LocalTaskExecutor handles tasks whose upstream request is synchronous. The
-// submit endpoint has already persisted the request body and returned the
-// public task ID; this method runs later in the task worker.
+// submit endpoint has already persisted the request payload and task row; this
+// method runs later in the task worker.
 type LocalTaskExecutor interface {
 	ExecuteLocalTask(ctx context.Context, task *model.Task, ch *model.Channel) (*relaycommon.TaskInfo, []byte, error)
 }
@@ -45,10 +45,9 @@ type LocalTaskExecutor interface {
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
 const (
-	synchronousImageTaskTimeout     = 300 * time.Second
-	synchronousImageTaskMaxAttempts = 2
-	synchronousImageHeartbeat       = 30 * time.Second
-	synchronousImageStaleAfter      = 90 * time.Second
+	synchronousImageTaskTimeout = 300 * time.Second
+	synchronousImageHeartbeat   = 30 * time.Second
+	synchronousImageStaleAfter  = 90 * time.Second
 )
 
 var synchronousImageTaskSlotsOnce sync.Once
@@ -87,10 +86,12 @@ func sweepTimedOutTasks(ctx context.Context) {
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 
 		oldStatus := task.Status
+		payloadFile := task.PrivateData.RequestPayloadFile
 		task.Status = model.TaskStatusFailure
 		task.Progress = "100%"
 		task.FinishTime = now
 		task.PrivateData.RequestBody = nil
+		task.PrivateData.RequestPayloadFile = ""
 		task.PrivateData.RequestContentType = ""
 		if isLegacy {
 			task.FailReason = legacyReason
@@ -111,6 +112,9 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
+		if err := RemoveAsyncImagePayload(payloadFile); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("remove timed-out image task payload %s: %v", task.TaskID, err))
+		}
 		if !isLegacy && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
@@ -137,9 +141,12 @@ func failInterruptedSynchronousImageTasks(ctx context.Context) int {
 		return 0
 	}
 
-	for _, task := range tasks {
-		if task.Quota != 0 {
-			RefundTaskQuota(ctx, task, reason)
+	for _, failed := range tasks {
+		if err := RemoveAsyncImagePayload(failed.PayloadFile); err != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("remove interrupted image task payload %s: %v", failed.Task.TaskID, err))
+		}
+		if failed.Task.Quota != 0 {
+			RefundTaskQuota(ctx, failed.Task, reason)
 		}
 	}
 	return len(tasks)
@@ -312,7 +319,7 @@ func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks
 func TryDispatchLocalTask(task *model.Task) bool {
 	if task == nil || task.Platform != constant.TaskPlatformAsyncImage ||
 		task.PrivateData.UpstreamMode != constant.TaskImageUpstreamModeSync ||
-		len(task.PrivateData.RequestBody) == 0 || GetTaskAdaptorFunc == nil {
+		(task.PrivateData.RequestPayloadFile == "" && len(task.PrivateData.RequestBody) == 0) || GetTaskAdaptorFunc == nil {
 		return false
 	}
 	adaptor := GetTaskAdaptorFunc(task.Platform)
@@ -377,114 +384,102 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 
 	isSynchronousImageTask := task.Platform == constant.TaskPlatformAsyncImage &&
 		task.PrivateData.UpstreamMode == constant.TaskImageUpstreamModeSync
-	claimed := false
-	for {
-		previousStatus := task.Status
-		now := time.Now().Unix()
-		task.Status = model.TaskStatusInProgress
-		task.Progress = taskcommon.ProgressInProgress
-		if task.StartTime == 0 {
-			task.StartTime = now
-		}
-		if isSynchronousImageTask {
-			task.PrivateData.LocalTaskAttempts++
-		}
-		if !claimed {
-			var won bool
-			if isSynchronousImageTask {
-				won, err = task.ClaimLocalTaskWithStatus(previousStatus)
-			} else {
-				won, err = task.UpdateWithStatus(previousStatus)
-			}
-			if err != nil {
-				return fmt.Errorf("claim local task %s: %w", task.TaskID, err)
-			}
-			if !won {
-				return nil
-			}
-			claimed = true
-		}
-
-		attemptCtx := ctx
-		cancelAttempt := func() {}
-		if isSynchronousImageTask {
-			attemptCtx, cancelAttempt = context.WithTimeout(ctx, synchronousImageTaskTimeout)
-		}
-		taskResult, responseBody, executeErr := executor.ExecuteLocalTask(attemptCtx, task, ch)
-		cancelAttempt()
-		if executeErr != nil {
-			retryable := errors.Is(executeErr, context.DeadlineExceeded)
-			var retryableError interface{ Retryable() bool }
-			if errors.As(executeErr, &retryableError) && retryableError.Retryable() {
-				retryable = true
-			}
-			if isSynchronousImageTask && ctx.Err() == nil && retryable && task.PrivateData.LocalTaskAttempts < synchronousImageTaskMaxAttempts {
-				task.FailReason = ""
-				logger.LogWarn(ctx, fmt.Sprintf(
-					"Synchronous image task %s attempt %d failed, retrying once: %s",
-					task.TaskID,
-					task.PrivateData.LocalTaskAttempts,
-					executeErr.Error(),
-				))
-				continue
-			}
-
-			failureReason := executeErr.Error()
-			if errors.Is(executeErr, context.DeadlineExceeded) {
-				failureReason = fmt.Sprintf("synchronous image upstream timed out after %d seconds", int(synchronousImageTaskTimeout.Seconds()))
-			}
-			if err := failLocalTask(ctx, task, failureReason, responseBody); err != nil {
-				return err
-			}
-			return executeErr
-		}
-		if taskResult == nil {
-			err := fmt.Errorf("local task %s returned no result", task.TaskID)
-			if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
-				return persistErr
-			}
-			return err
-		}
-
-		task.Status = model.TaskStatus(taskResult.Status)
-		if task.Status == "" {
-			task.Status = model.TaskStatusSuccess
-		}
-		if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
-			err := fmt.Errorf("local task %s returned non-terminal status %s", task.TaskID, task.Status)
-			if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
-				return persistErr
-			}
-			return err
-		}
-		task.Progress = taskResult.Progress
-		if task.Progress == "" {
-			task.Progress = taskcommon.ProgressComplete
-		}
-		task.FinishTime = time.Now().Unix()
-		task.Data = responseBody
-		task.PrivateData.RequestBody = nil
-		task.PrivateData.RequestContentType = ""
-		if taskResult.Url != "" {
-			task.PrivateData.ResultURL = taskResult.Url
-		}
-		if task.Status == model.TaskStatusFailure {
-			task.FailReason = taskResult.Reason
-		}
-		updated, err := task.UpdateWithStatus(model.TaskStatusInProgress)
-		if err != nil {
-			return fmt.Errorf("persist local task result %s: %w", task.TaskID, err)
-		}
-		if !updated {
-			return nil
-		}
-		if task.Status == model.TaskStatusSuccess {
-			settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-		} else if task.Status == model.TaskStatusFailure && task.Quota != 0 {
-			RefundTaskQuota(ctx, task, task.FailReason)
-		}
+	previousStatus := task.Status
+	now := time.Now().Unix()
+	task.Status = model.TaskStatusInProgress
+	task.Progress = taskcommon.ProgressInProgress
+	if task.StartTime == 0 {
+		task.StartTime = now
+	}
+	if isSynchronousImageTask {
+		task.PrivateData.LocalTaskAttempts++
+	}
+	var won bool
+	if isSynchronousImageTask {
+		won, err = task.ClaimLocalTaskWithStatus(previousStatus)
+	} else {
+		won, err = task.UpdateWithStatus(previousStatus)
+	}
+	if err != nil {
+		return fmt.Errorf("claim local task %s: %w", task.TaskID, err)
+	}
+	if !won {
 		return nil
 	}
+
+	payloadFile := task.PrivateData.RequestPayloadFile
+	if payloadFile != "" {
+		defer func() {
+			if removeErr := RemoveAsyncImagePayload(payloadFile); removeErr != nil {
+				logger.LogWarn(ctx, fmt.Sprintf("remove image task payload %s: %v", task.TaskID, removeErr))
+			}
+		}()
+	}
+
+	attemptCtx := ctx
+	cancelAttempt := func() {}
+	if isSynchronousImageTask {
+		attemptCtx, cancelAttempt = context.WithTimeout(ctx, synchronousImageTaskTimeout)
+	}
+	taskResult, responseBody, executeErr := executor.ExecuteLocalTask(attemptCtx, task, ch)
+	cancelAttempt()
+	if executeErr != nil {
+		failureReason := executeErr.Error()
+		if errors.Is(executeErr, context.DeadlineExceeded) {
+			failureReason = fmt.Sprintf("synchronous image upstream timed out after %d seconds", int(synchronousImageTaskTimeout.Seconds()))
+		}
+		if err := failLocalTask(ctx, task, failureReason, responseBody); err != nil {
+			return err
+		}
+		return executeErr
+	}
+	if taskResult == nil {
+		err := fmt.Errorf("local task %s returned no result", task.TaskID)
+		if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
+			return persistErr
+		}
+		return err
+	}
+
+	task.Status = model.TaskStatus(taskResult.Status)
+	if task.Status == "" {
+		task.Status = model.TaskStatusSuccess
+	}
+	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		err := fmt.Errorf("local task %s returned non-terminal status %s", task.TaskID, task.Status)
+		if persistErr := failLocalTask(ctx, task, err.Error(), responseBody); persistErr != nil {
+			return persistErr
+		}
+		return err
+	}
+	task.Progress = taskResult.Progress
+	if task.Progress == "" {
+		task.Progress = taskcommon.ProgressComplete
+	}
+	task.FinishTime = time.Now().Unix()
+	task.Data = responseBody
+	task.PrivateData.RequestPayloadFile = ""
+	task.PrivateData.RequestBody = nil
+	task.PrivateData.RequestContentType = ""
+	if taskResult.Url != "" {
+		task.PrivateData.ResultURL = taskResult.Url
+	}
+	if task.Status == model.TaskStatusFailure {
+		task.FailReason = taskResult.Reason
+	}
+	updated, err := task.UpdateWithStatus(model.TaskStatusInProgress)
+	if err != nil {
+		return fmt.Errorf("persist local task result %s: %w", task.TaskID, err)
+	}
+	if !updated {
+		return nil
+	}
+	if task.Status == model.TaskStatusSuccess {
+		settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+	} else if task.Status == model.TaskStatusFailure && task.Quota != 0 {
+		RefundTaskQuota(ctx, task, task.FailReason)
+	}
+	return nil
 }
 
 func failLocalTask(ctx context.Context, task *model.Task, reason string, responseBody []byte) error {
@@ -493,10 +488,15 @@ func failLocalTask(ctx context.Context, task *model.Task, reason string, respons
 	task.FinishTime = time.Now().Unix()
 	task.FailReason = reason
 	task.Data = responseBody
+	task.PrivateData.RequestPayloadFile = ""
 	task.PrivateData.RequestBody = nil
 	task.PrivateData.RequestContentType = ""
-	if _, updateErr := task.UpdateWithStatus(model.TaskStatusInProgress); updateErr != nil {
+	updated, updateErr := task.UpdateWithStatus(model.TaskStatusInProgress)
+	if updateErr != nil {
 		return fmt.Errorf("persist local task failure %s: %w", task.TaskID, updateErr)
+	}
+	if !updated {
+		return nil
 	}
 	if task.Quota != 0 {
 		RefundTaskQuota(ctx, task, task.FailReason)

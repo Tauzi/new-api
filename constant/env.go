@@ -21,6 +21,7 @@ var ErrorLogEnabled bool
 var TaskQueryLimit int
 var TaskTimeoutMinutes int
 var AsyncImageWorkerSlots int
+var AsyncImageQueueDir string
 
 // temporary variable for sora patch, will be removed in future
 var TaskPricePatches []string

@@ -55,6 +55,23 @@ type blockingLocalTaskExecutor struct {
 
 type completedImagePollingAdaptor struct{}
 
+func useTestAsyncImageQueue(t *testing.T) {
+	t.Helper()
+	previous := constant.AsyncImageQueueDir
+	constant.AsyncImageQueueDir = t.TempDir()
+	t.Cleanup(func() { constant.AsyncImageQueueDir = previous })
+}
+
+func writeTestAsyncImagePayload(t *testing.T, taskID, body string) string {
+	t.Helper()
+	filename, err := WriteAsyncImagePayload(taskID, func(dst io.Writer) error {
+		_, writeErr := io.WriteString(dst, body)
+		return writeErr
+	})
+	require.NoError(t, err)
+	return filename
+}
+
 func (a *completedImagePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
 func (a *completedImagePollingAdaptor) FetchTask(_ string, _ string, _ map[string]any, _ string) (*http.Response, error) {
@@ -292,8 +309,10 @@ func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID st
 
 func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	truncate(t)
+	useTestAsyncImageQueue(t)
 	const channelID = 601
 	seedTaskPollingChannel(t, channelID, true)
+	payloadFile := writeTestAsyncImagePayload(t, "task_local_sync", `{"model":"sync-image","prompt":"test"}`)
 	task := &model.Task{
 		TaskID:    "task_local_sync",
 		Platform:  constant.TaskPlatformAsyncImage,
@@ -306,7 +325,7 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 		UpdatedAt: time.Now().Unix(),
 		PrivateData: model.TaskPrivateData{
 			UpstreamMode:       constant.TaskImageUpstreamModeSync,
-			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+			RequestPayloadFile: payloadFile,
 			RequestContentType: "application/json",
 		},
 	}
@@ -324,11 +343,14 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	assert.Equal(t, 1, executor.calls)
 	assert.Equal(t, "100%", task.Progress)
 	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
-	assert.Empty(t, task.PrivateData.RequestBody)
+	assert.Empty(t, task.PrivateData.RequestPayloadFile)
+	_, err := OpenAsyncImagePayload(payloadFile)
+	assert.Error(t, err)
 }
 
 func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T) {
 	truncate(t)
+	useTestAsyncImageQueue(t)
 	now := time.Now().Unix()
 	tasks := []*model.Task{
 		{
@@ -339,8 +361,8 @@ func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T)
 			CreatedAt: now,
 			UpdatedAt: now,
 			PrivateData: model.TaskPrivateData{
-				UpstreamMode: constant.TaskImageUpstreamModeSync,
-				RequestBody:  []byte(`{"prompt":"queued"}`),
+				UpstreamMode:       constant.TaskImageUpstreamModeSync,
+				RequestPayloadFile: "task_local_queued-123.payload",
 			},
 		},
 		{
@@ -351,8 +373,8 @@ func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T)
 			CreatedAt: now,
 			UpdatedAt: now,
 			PrivateData: model.TaskPrivateData{
-				UpstreamMode: constant.TaskImageUpstreamModeSync,
-				RequestBody:  []byte(`{"prompt":"running"}`),
+				UpstreamMode:       constant.TaskImageUpstreamModeSync,
+				RequestPayloadFile: "task_local_in_progress-123.payload",
 			},
 		},
 		{
@@ -375,7 +397,7 @@ func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T)
 	localTasks := model.GetQueuedLocalImageTasks(1)
 	require.Len(t, localTasks, 1)
 	assert.Equal(t, "task_local_queued", localTasks[0].TaskID)
-	assert.Equal(t, []byte(`{"prompt":"queued"}`), localTasks[0].PrivateData.RequestBody)
+	assert.Equal(t, "task_local_queued-123.payload", localTasks[0].PrivateData.RequestPayloadFile)
 
 	remoteTasks := model.GetAllUnFinishRemoteTasks(10)
 	require.Len(t, remoteTasks, 1)
@@ -384,6 +406,7 @@ func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T)
 
 func TestSynchronousImageConcurrencyUsesGlobalConfigurableSlots(t *testing.T) {
 	truncate(t)
+	useTestAsyncImageQueue(t)
 	const firstChannelID = 605
 	const secondChannelID = 606
 	seedTaskPollingChannel(t, firstChannelID, true)
@@ -411,7 +434,7 @@ func TestSynchronousImageConcurrencyUsesGlobalConfigurableSlots(t *testing.T) {
 			UpdatedAt: time.Now().Unix(),
 			PrivateData: model.TaskPrivateData{
 				UpstreamMode:       constant.TaskImageUpstreamModeSync,
-				RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+				RequestPayloadFile: writeTestAsyncImagePayload(t, id, `{"model":"sync-image","prompt":"test"}`),
 				RequestContentType: "application/json",
 			},
 		}
@@ -460,14 +483,22 @@ func TestSynchronousImageConcurrencyUsesGlobalConfigurableSlots(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {
+func TestUpdateLocalTasksTimesOutSynchronousImageWithoutRetry(t *testing.T) {
 	truncate(t)
-	const channelID = 603
+	useTestAsyncImageQueue(t)
+	const (
+		channelID    = 603
+		userID       = 406
+		initialQuota = 10_000
+		taskQuota    = 1_500
+	)
+	seedUser(t, userID, initialQuota)
 	seedTaskPollingChannel(t, channelID, true)
 	task := &model.Task{
 		TaskID:    "task_local_sync_retry",
 		Platform:  constant.TaskPlatformAsyncImage,
-		UserId:    1,
+		UserId:    userID,
+		Quota:     taskQuota,
 		ChannelId: channelID,
 		Action:    constant.TaskActionImageGenerate,
 		Status:    model.TaskStatusQueued,
@@ -476,8 +507,9 @@ func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {
 		UpdatedAt: time.Now().Unix(),
 		PrivateData: model.TaskPrivateData{
 			UpstreamMode:       constant.TaskImageUpstreamModeSync,
-			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
+			RequestPayloadFile: writeTestAsyncImagePayload(t, "task_local_sync_retry", `{"model":"sync-image","prompt":"test"}`),
 			RequestContentType: "application/json",
+			BillingSource:      BillingSourceWallet,
 		},
 	}
 	require.NoError(t, model.DB.Create(task).Error)
@@ -489,66 +521,25 @@ func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {
 
 	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
 	require.Eventually(t, func() bool {
-		return task.Status == model.TaskStatusSuccess
+		return task.Status == model.TaskStatusFailure
 	}, 2*time.Second, 10*time.Millisecond)
-	assert.Equal(t, 2, executor.calls)
-	require.Len(t, executor.deadlines, 2)
+	assert.Equal(t, 1, executor.calls)
+	require.Len(t, executor.deadlines, 1)
 	for _, remaining := range executor.deadlines {
 		assert.Greater(t, remaining, 299*time.Second)
 		assert.LessOrEqual(t, remaining, 300*time.Second)
 	}
-	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
-	assert.Equal(t, 2, task.PrivateData.LocalTaskAttempts)
-	assert.Equal(t, "https://example.com/retried.png", task.PrivateData.ResultURL)
-	assert.Empty(t, task.PrivateData.RequestBody)
-
-	var persisted model.Task
-	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
-	assert.Equal(t, 2, persisted.PrivateData.LocalTaskAttempts)
-	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
-}
-
-func TestUpdateLocalTasksStopsAfterOneSynchronousImageRetry(t *testing.T) {
-	truncate(t)
-	const channelID = 604
-	seedTaskPollingChannel(t, channelID, true)
-	task := &model.Task{
-		TaskID:    "task_local_sync_retry_exhausted",
-		Platform:  constant.TaskPlatformAsyncImage,
-		UserId:    1,
-		ChannelId: channelID,
-		Action:    constant.TaskActionImageGenerate,
-		Status:    model.TaskStatusQueued,
-		Progress:  "10%",
-		CreatedAt: time.Now().Unix(),
-		UpdatedAt: time.Now().Unix(),
-		PrivateData: model.TaskPrivateData{
-			UpstreamMode:       constant.TaskImageUpstreamModeSync,
-			RequestBody:        []byte(`{"model":"sync-image","prompt":"test"}`),
-			RequestContentType: "application/json",
-		},
-	}
-	require.NoError(t, model.DB.Create(task).Error)
-
-	executor := &timeoutThenSuccessLocalTaskExecutor{timeoutFailures: 2}
-	previousFactory := GetTaskAdaptorFunc
-	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return executor }
-	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
-
-	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
-	require.Eventually(t, func() bool {
-		return task.Status == model.TaskStatusFailure
-	}, 2*time.Second, 10*time.Millisecond)
-	assert.Equal(t, 2, executor.calls)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
-	assert.Equal(t, 2, task.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, 1, task.PrivateData.LocalTaskAttempts)
 	assert.Equal(t, "synchronous image upstream timed out after 300 seconds", task.FailReason)
-	assert.Empty(t, task.PrivateData.RequestBody)
+	assert.Empty(t, task.PrivateData.RequestPayloadFile)
 
 	var persisted model.Task
 	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
-	assert.Equal(t, 2, persisted.PrivateData.LocalTaskAttempts)
+	assert.Equal(t, 1, persisted.PrivateData.LocalTaskAttempts)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
+	assert.Zero(t, persisted.Quota)
+	assert.Equal(t, initialQuota+taskQuota, getUserQuota(t, userID))
 }
 
 func TestUpdateVideoTasksRewritesAsynchronousImageResultURL(t *testing.T) {
@@ -895,6 +886,7 @@ func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
 
 func TestInterruptedSynchronousImageTaskFailsAndRefundsWithoutRetry(t *testing.T) {
 	truncate(t)
+	useTestAsyncImageQueue(t)
 
 	const userID, initialQuota, taskQuota = 405, 10_000, 1_500
 	seedUser(t, userID, initialQuota)
@@ -905,7 +897,8 @@ func TestInterruptedSynchronousImageTaskFailsAndRefundsWithoutRetry(t *testing.T
 	task.Progress = "50%"
 	task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
 	task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeSync
-	task.PrivateData.RequestBody = []byte("persisted multipart request")
+	payloadFile := writeTestAsyncImagePayload(t, task.TaskID, "persisted multipart request")
+	task.PrivateData.RequestPayloadFile = payloadFile
 	task.PrivateData.RequestContentType = "multipart/form-data"
 	require.NoError(t, model.DB.Create(task).Error)
 	require.NoError(t, model.DB.Model(&model.Task{}).
@@ -920,8 +913,10 @@ func TestInterruptedSynchronousImageTaskFailsAndRefundsWithoutRetry(t *testing.T
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
 	assert.Equal(t, "100%", reloaded.Progress)
 	assert.Contains(t, reloaded.FailReason, "结果无法确认")
-	assert.Empty(t, reloaded.PrivateData.RequestBody)
+	assert.Empty(t, reloaded.PrivateData.RequestPayloadFile)
 	assert.Empty(t, reloaded.PrivateData.RequestContentType)
+	_, err := OpenAsyncImagePayload(payloadFile)
+	assert.Error(t, err)
 	assert.Zero(t, reloaded.Quota)
 	assert.Equal(t, initialQuota+taskQuota, getUserQuota(t, userID))
 	assert.Equal(t, int64(1), countLogs(t))
@@ -933,6 +928,7 @@ func TestInterruptedSynchronousImageTaskFailsAndRefundsWithoutRetry(t *testing.T
 
 func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	truncate(t)
+	useTestAsyncImageQueue(t)
 
 	const (
 		userID          = 403
@@ -954,7 +950,8 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	modernTask.TaskID = "modern_timeout_with_refund"
 	modernTask.Progress = "50%"
 	modernTask.SubmitTime = 1771718400 // 2026-02-22 00:00:00 UTC
-	modernTask.PrivateData.RequestBody = []byte("modern image request")
+	modernPayloadFile := writeTestAsyncImagePayload(t, modernTask.TaskID, "modern image request")
+	modernTask.PrivateData.RequestPayloadFile = modernPayloadFile
 	modernTask.PrivateData.RequestContentType = "multipart/form-data"
 	require.NoError(t, model.DB.Create(modernTask).Error)
 
@@ -975,9 +972,11 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	assert.Contains(t, reloadedLegacy.FailReason, "旧系统遗留任务")
 	assert.Contains(t, reloadedModern.FailReason, "任务超时")
 	assert.Empty(t, reloadedLegacy.PrivateData.RequestBody)
-	assert.Empty(t, reloadedModern.PrivateData.RequestBody)
+	assert.Empty(t, reloadedModern.PrivateData.RequestPayloadFile)
 	assert.Empty(t, reloadedLegacy.PrivateData.RequestContentType)
 	assert.Empty(t, reloadedModern.PrivateData.RequestContentType)
 	assert.Equal(t, initialQuota+modernTaskQuota, getUserQuota(t, userID))
 	assert.Equal(t, int64(1), countLogs(t))
+	_, err := OpenAsyncImagePayload(modernPayloadFile)
+	assert.Error(t, err)
 }

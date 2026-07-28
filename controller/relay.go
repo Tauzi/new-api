@@ -592,10 +592,13 @@ func RelayTask(c *gin.Context) {
 
 	// ── 成功：结算 + 日志 + 插入任务 ──
 	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-			common.SysError("settle task billing error: " + settleErr.Error())
+		isLocalImageTask := result.LocalTaskData != nil
+		if !isLocalImageTask {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError("settle task billing error: " + settleErr.Error())
+			}
+			service.LogTaskConsumption(c, relayInfo)
 		}
-		service.LogTaskConsumption(c, relayInfo)
 
 		task := model.InitTask(result.Platform, relayInfo)
 		if result.Platform == constant.TaskPlatformAsyncImage {
@@ -605,7 +608,7 @@ func RelayTask(c *gin.Context) {
 		if result.LocalTaskData != nil {
 			task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeSync
 			task.PrivateData.Key = relayInfo.ApiKey
-			task.PrivateData.RequestBody = result.LocalTaskData.RequestBody
+			task.PrivateData.RequestPayloadFile = result.LocalTaskData.PayloadFile
 			task.PrivateData.RequestContentType = result.LocalTaskData.ContentType
 		} else if result.Platform == constant.TaskPlatformAsyncImage {
 			task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeAsync
@@ -628,15 +631,30 @@ func RelayTask(c *gin.Context) {
 		task.Action = relayInfo.Action
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
-		} else if result.Platform == constant.TaskPlatformAsyncImage && constant.UpdateTask {
-			if result.LocalTaskData != nil {
-				service.TryDispatchLocalTask(task)
-			}
-			gopool.Go(func() {
-				if _, _, enqueueErr := service.EnqueueSystemTask(model.SystemTaskTypeAsyncTaskPoll, nil); enqueueErr != nil {
-					common.SysError("enqueue image task polling error: " + enqueueErr.Error())
+			if isLocalImageTask {
+				if removeErr := service.RemoveAsyncImagePayload(result.LocalTaskData.PayloadFile); removeErr != nil {
+					common.SysError("remove uncommitted image task payload: " + removeErr.Error())
 				}
-			})
+				taskErr = service.TaskErrorWrapperLocal(insertErr, "insert_task_failed", http.StatusInternalServerError)
+			}
+		} else {
+			if isLocalImageTask {
+				if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+					common.SysError("settle task billing error: " + settleErr.Error())
+				}
+				service.LogTaskConsumption(c, relayInfo)
+				c.JSON(http.StatusOK, dto.NewOpenAIImageTask(task.TaskID, relayInfo.OriginModelName))
+			}
+			if result.Platform == constant.TaskPlatformAsyncImage && constant.UpdateTask {
+				if isLocalImageTask {
+					service.TryDispatchLocalTask(task)
+				}
+				gopool.Go(func() {
+					if _, _, enqueueErr := service.EnqueueSystemTask(model.SystemTaskTypeAsyncTaskPoll, nil); enqueueErr != nil {
+						common.SysError("enqueue image task polling error: " + enqueueErr.Error())
+					}
+				})
+			}
 		}
 	}
 

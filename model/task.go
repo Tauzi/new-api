@@ -103,9 +103,10 @@ func (m Properties) Value() (driver.Value, error) {
 
 type TaskPrivateData struct {
 	Key                string `json:"key,omitempty"`
-	UpstreamTaskID     string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
-	UpstreamMode       string `json:"upstream_mode,omitempty"`    // "async" uses provider task polling; "sync" runs a local worker
-	RequestBody        []byte `json:"request_body,omitempty"`     // persisted local-sync request body (JSON base64 or multipart bytes)
+	UpstreamTaskID     string `json:"upstream_task_id,omitempty"`     // 上游真实 task ID
+	UpstreamMode       string `json:"upstream_mode,omitempty"`        // "async" uses provider task polling; "sync" runs a local worker
+	RequestPayloadFile string `json:"request_payload_file,omitempty"` // local-sync request file under the async image queue directory
+	RequestBody        []byte `json:"request_body,omitempty"`         // legacy local-sync request body; new tasks use RequestPayloadFile
 	RequestContentType string `json:"request_content_type,omitempty"`
 	LocalTaskAttempts  int    `json:"local_task_attempts,omitempty"`
 	ResultURL          string `json:"result_url,omitempty"` // 任务成功后的结果 URL（视频地址等）
@@ -164,7 +165,7 @@ func (p *TaskPrivateData) Scan(val interface{}) error {
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if p.Key == "" && p.UpstreamTaskID == "" && p.UpstreamMode == "" &&
-		len(p.RequestBody) == 0 && p.RequestContentType == "" && p.LocalTaskAttempts == 0 &&
+		p.RequestPayloadFile == "" && len(p.RequestBody) == 0 && p.RequestContentType == "" && p.LocalTaskAttempts == 0 &&
 		p.ResultURL == "" && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil {
 		return nil, nil
@@ -330,9 +331,20 @@ func taskPrivateDataUpstreamModeExpression() string {
 	}
 }
 
+func taskPrivateDataPayloadFileExpression() string {
+	switch {
+	case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
+		return "private_data->>'request_payload_file'"
+	case common.UsingMainDatabase(common.DatabaseTypeMySQL):
+		return "JSON_UNQUOTE(JSON_EXTRACT(private_data, '$.request_payload_file'))"
+	default:
+		return "json_extract(private_data, '$.request_payload_file')"
+	}
+}
+
 // GetAllUnFinishRemoteTasks excludes local synchronous image jobs. Their
-// private_data contains the complete persisted request body and is loaded only
-// when a worker slot is available.
+// payloads are held in the disk queue and loaded only when a worker slot is
+// available.
 func GetAllUnFinishRemoteTasks(limit int) []*Task {
 	var tasks []*Task
 	modeExpression := taskPrivateDataUpstreamModeExpression()
@@ -348,8 +360,8 @@ func GetAllUnFinishRemoteTasks(limit int) []*Task {
 	return tasks
 }
 
-// GetQueuedLocalImageTasks loads at most limit request bodies. In-progress
-// local jobs are owned by workers and must not be decoded again by polling.
+// GetQueuedLocalImageTasks loads only as many queued jobs as there are worker
+// slots. In-progress local jobs are owned by workers and are not loaded again.
 func GetQueuedLocalImageTasks(limit int) []*Task {
 	if limit <= 0 {
 		return nil
@@ -369,51 +381,71 @@ func GetQueuedLocalImageTasks(limit int) []*Task {
 	return tasks
 }
 
+type FailedLocalImageTask struct {
+	Task        *Task
+	PayloadFile string
+}
+
 // FailStaleInProgressLocalImageTasks atomically terminalizes workers that lost
-// their heartbeat and removes persisted request bodies before loading them for refunds.
-func FailStaleInProgressLocalImageTasks(cutoff int64, limit int, reason string) ([]*Task, error) {
+// their heartbeat and removes payload references before loading them for refunds.
+func FailStaleInProgressLocalImageTasks(cutoff int64, limit int, reason string) ([]FailedLocalImageTask, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	modeExpression := taskPrivateDataUpstreamModeExpression()
-	var ids []int64
+	type payloadCandidate struct {
+		ID          int64
+		PayloadFile string `gorm:"column:request_payload_file"`
+	}
+	var candidates []payloadCandidate
 	err := DB.Model(&Task{}).
+		Select("id, "+taskPrivateDataPayloadFileExpression()+" AS request_payload_file").
 		Where("platform = ?", constant.TaskPlatformAsyncImage).
 		Where("status = ?", TaskStatusInProgress).
 		Where("updated_at < ?", cutoff).
 		Where("COALESCE("+modeExpression+", '') = ?", constant.TaskImageUpstreamModeSync).
 		Order("id").
 		Limit(limit).
-		Pluck("id", &ids).Error
-	if err != nil || len(ids) == 0 {
+		Scan(&candidates).Error
+	if err != nil || len(candidates) == 0 {
 		return nil, err
 	}
-
-	privateDataWithoutRequest := "json_remove(private_data, '$.request_body', '$.request_content_type')"
+	privateDataWithoutRequest := "json_remove(private_data, '$.request_payload_file', '$.request_body', '$.request_content_type')"
 	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
-		privateDataWithoutRequest = "(private_data::jsonb - 'request_body' - 'request_content_type')::json"
+		privateDataWithoutRequest = "(private_data::jsonb - 'request_payload_file' - 'request_body' - 'request_content_type')::json"
 	} else if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-		privateDataWithoutRequest = "JSON_REMOVE(private_data, '$.request_body', '$.request_content_type')"
+		privateDataWithoutRequest = "JSON_REMOVE(private_data, '$.request_payload_file', '$.request_body', '$.request_content_type')"
 	}
 	now := time.Now().Unix()
-	result := DB.Model(&Task{}).
-		Where("id IN ? AND status = ? AND updated_at < ?", ids, TaskStatusInProgress, cutoff).
-		Updates(map[string]any{
-			"status":       TaskStatusFailure,
-			"progress":     "100%",
-			"finish_time":  now,
-			"fail_reason":  reason,
-			"private_data": gorm.Expr(privateDataWithoutRequest),
-			"updated_at":   now,
+	failed := make([]FailedLocalImageTask, 0, len(candidates))
+	for _, candidate := range candidates {
+		var task Task
+		won := false
+		err = DB.Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&Task{}).
+				Where("id = ? AND status = ? AND updated_at < ?", candidate.ID, TaskStatusInProgress, cutoff).
+				Updates(map[string]any{
+					"status":       TaskStatusFailure,
+					"progress":     "100%",
+					"finish_time":  now,
+					"fail_reason":  reason,
+					"private_data": gorm.Expr(privateDataWithoutRequest),
+					"updated_at":   now,
+				})
+			if result.Error != nil || result.RowsAffected == 0 {
+				return result.Error
+			}
+			won = true
+			return tx.First(&task, candidate.ID).Error
 		})
-	if result.Error != nil || result.RowsAffected == 0 {
-		return nil, result.Error
+		if err != nil {
+			return failed, err
+		}
+		if won {
+			failed = append(failed, FailedLocalImageTask{Task: &task, PayloadFile: candidate.PayloadFile})
+		}
 	}
-
-	var tasks []*Task
-	err = DB.Where("id IN ? AND status = ? AND finish_time = ? AND fail_reason = ?", ids, TaskStatusFailure, now, reason).
-		Find(&tasks).Error
-	return tasks, err
+	return failed, nil
 }
 
 func TouchInProgressLocalImageTask(id int64) error {

@@ -17,8 +17,10 @@ NewAPI 生成的任务 ID，渠道设置决定 NewAPI 如何调用上游。
 - 在系统模型定价中为每个异步模型分别配置按次价格。代码不会预设价格，
   以避免覆盖实际采购成本。
 - 保持 `UPDATE_TASK=true`（默认值），否则后台不会轮询异步任务。
-- `ASYNC_IMAGE_WORKER_SLOTS` 控制“同步上游生图”在单个 NewAPI 进程中的最大并发数，默认 `20`。超过执行槽数量的任务保持 `QUEUED`，有槽释放后继续执行。worker 只会从数据库加载当前空闲槽所需的请求体，不会反复加载正在执行的图片任务。此设置不影响异步上游生图、视频及其他请求，修改后需要重启 NewAPI。内存小于 4 GB 或大量使用 multipart 参考图时建议设置为 `5`–`10`；需要 50 并发时可显式设置 `ASYNC_IMAGE_WORKER_SLOTS=50`。
-- 同步上游 worker 每 30 秒更新一次轻量心跳。进程重启或异常退出后，超过 90 秒没有心跳的 `IN_PROGRESS` 任务会标记为失败、清除请求体并退款，不会重新请求上游造成重复生图。
+- `ASYNC_IMAGE_WORKER_SLOTS` 控制“同步上游生图”在单个 NewAPI 进程中的最大并发数，默认 `20`。超过执行槽数量的任务保持 `QUEUED`，有槽释放后继续执行。此设置不影响异步上游生图、视频及其他请求，修改后需要重启 NewAPI。需要 50 并发时可显式设置 `ASYNC_IMAGE_WORKER_SLOTS=50`。
+- 同步上游请求内容写入 `ASYNC_IMAGE_QUEUE_DIR`（Docker Compose 默认为 `/data/async-image-queue`），PostgreSQL 只保存文件名，不再保存完整 JSON 或 multipart 图片。`QUEUED` 任务可在重启后从 `/data` 数据卷继续执行；成功或失败后都会删除对应 payload 文件。
+- 同步上游只请求一次，硬超时为 300 秒。达到超时、连接失败或上游返回错误时，任务立即标记为 `FAILURE`、删除 payload 并退款，不自动重试，避免重复生图。
+- 同步上游 worker 每 30 秒更新一次轻量心跳。进程重启或异常退出后，超过 90 秒没有心跳的 `IN_PROGRESS` 任务会标记为失败、删除 payload 并退款，不会重新请求上游造成重复生图。
 
 ## 提交任务
 
