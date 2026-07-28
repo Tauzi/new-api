@@ -908,12 +908,16 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	legacyTask.TaskID = "legacy_timeout_without_refund"
 	legacyTask.Progress = "50%"
 	legacyTask.SubmitTime = 1771718399 // 2026-02-21 23:59:59 UTC
+	legacyTask.PrivateData.RequestBody = []byte("legacy image request")
+	legacyTask.PrivateData.RequestContentType = "multipart/form-data"
 	require.NoError(t, model.DB.Create(legacyTask).Error)
 
 	modernTask := makeTask(userID, 0, modernTaskQuota, 0, BillingSourceWallet, 0)
 	modernTask.TaskID = "modern_timeout_with_refund"
 	modernTask.Progress = "50%"
 	modernTask.SubmitTime = 1771718400 // 2026-02-22 00:00:00 UTC
+	modernTask.PrivateData.RequestBody = []byte("modern image request")
+	modernTask.PrivateData.RequestContentType = "multipart/form-data"
 	require.NoError(t, model.DB.Create(modernTask).Error)
 
 	previousTimeout := constant.TaskTimeoutMinutes
@@ -932,6 +936,10 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	assert.Zero(t, reloadedModern.Quota)
 	assert.Contains(t, reloadedLegacy.FailReason, "旧系统遗留任务")
 	assert.Contains(t, reloadedModern.FailReason, "任务超时")
+	assert.Empty(t, reloadedLegacy.PrivateData.RequestBody)
+	assert.Empty(t, reloadedModern.PrivateData.RequestBody)
+	assert.Empty(t, reloadedLegacy.PrivateData.RequestContentType)
+	assert.Empty(t, reloadedModern.PrivateData.RequestContentType)
 	assert.Equal(t, initialQuota+modernTaskQuota, getUserQuota(t, userID))
 	assert.Equal(t, int64(1), countLogs(t))
 }

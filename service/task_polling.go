@@ -88,6 +88,8 @@ func sweepTimedOutTasks(ctx context.Context) {
 		task.Status = model.TaskStatusFailure
 		task.Progress = "100%"
 		task.FinishTime = now
+		task.PrivateData.RequestBody = nil
+		task.PrivateData.RequestContentType = ""
 		if isLegacy {
 			task.FailReason = legacyReason
 			// 旧系统任务明确不退款，随终态 CAS 一并清掉 quota，
