@@ -243,6 +243,67 @@ func TestClaimLocalTaskWithStatusDoesNotRewritePrivateData(t *testing.T) {
 	assert.Zero(t, reloaded.PrivateData.LocalTaskAttempts)
 }
 
+func TestRequeueStaleLocalImageTasksPreservesRequestBody(t *testing.T) {
+	truncateTables(t)
+	now := time.Now().Unix()
+
+	staleLocal := &Task{
+		TaskID:   "task_stale_local",
+		Platform: constant.TaskPlatformAsyncImage,
+		Status:   TaskStatusInProgress,
+		Progress: "50%",
+		PrivateData: TaskPrivateData{
+			UpstreamMode: constant.TaskImageUpstreamModeSync,
+			RequestBody:  []byte("persisted request"),
+		},
+	}
+	insertTask(t, staleLocal)
+	require.NoError(t, DB.Model(&Task{}).Where("id = ?", staleLocal.ID).Update("updated_at", now-120).Error)
+
+	recentLocal := &Task{
+		TaskID:   "task_recent_local",
+		Platform: constant.TaskPlatformAsyncImage,
+		Status:   TaskStatusInProgress,
+		Progress: "50%",
+		PrivateData: TaskPrivateData{
+			UpstreamMode: constant.TaskImageUpstreamModeSync,
+			RequestBody:  []byte("active request"),
+		},
+	}
+	insertTask(t, recentLocal)
+
+	staleRemote := &Task{
+		TaskID:   "task_stale_remote",
+		Platform: constant.TaskPlatformAsyncImage,
+		Status:   TaskStatusInProgress,
+		Progress: "50%",
+		PrivateData: TaskPrivateData{
+			UpstreamMode:   constant.TaskImageUpstreamModeAsync,
+			UpstreamTaskID: "upstream_task",
+		},
+	}
+	insertTask(t, staleRemote)
+	require.NoError(t, DB.Model(&Task{}).Where("id = ?", staleRemote.ID).Update("updated_at", now-120).Error)
+
+	requeued, err := RequeueStaleLocalImageTasks(now-90, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), requeued)
+
+	var recovered Task
+	require.NoError(t, DB.First(&recovered, staleLocal.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusQueued), recovered.Status)
+	assert.Equal(t, "10%", recovered.Progress)
+	assert.Equal(t, []byte("persisted request"), recovered.PrivateData.RequestBody)
+
+	var stillRunning Task
+	require.NoError(t, DB.First(&stillRunning, recentLocal.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusInProgress), stillRunning.Status)
+
+	var stillRemote Task
+	require.NoError(t, DB.First(&stillRemote, staleRemote.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusInProgress), stillRemote.Status)
+}
+
 func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {
 	truncateTables(t)
 

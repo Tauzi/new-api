@@ -368,6 +368,45 @@ func GetQueuedLocalImageTasks(limit int) []*Task {
 	return tasks
 }
 
+// RequeueStaleLocalImageTasks recovers workers lost when a process exits. The
+// second UPDATE condition prevents requeueing a task whose live worker renewed
+// its heartbeat after the candidate query.
+func RequeueStaleLocalImageTasks(cutoff int64, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	modeExpression := taskPrivateDataUpstreamModeExpression()
+	var ids []int64
+	err := DB.Model(&Task{}).
+		Where("platform = ?", constant.TaskPlatformAsyncImage).
+		Where("status = ?", TaskStatusInProgress).
+		Where("updated_at < ?", cutoff).
+		Where("COALESCE("+modeExpression+", '') = ?", constant.TaskImageUpstreamModeSync).
+		Order("id").
+		Limit(limit).
+		Pluck("id", &ids).Error
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+
+	now := time.Now().Unix()
+	result := DB.Model(&Task{}).
+		Where("id IN ? AND status = ? AND updated_at < ?", ids, TaskStatusInProgress, cutoff).
+		Updates(map[string]any{
+			"status":      TaskStatusQueued,
+			"progress":    "10%",
+			"fail_reason": "",
+			"updated_at":  now,
+		})
+	return result.RowsAffected, result.Error
+}
+
+func TouchInProgressLocalImageTask(id int64) error {
+	return DB.Model(&Task{}).
+		Where("id = ? AND status = ?", id, TaskStatusInProgress).
+		Update("updated_at", time.Now().Unix()).Error
+}
+
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is
 // still in progress. It is a cheap existence check (LIMIT 1) used to decide
 // whether the async_task_poll system task needs to run; when no task is pending

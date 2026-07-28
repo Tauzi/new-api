@@ -47,6 +47,8 @@ var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 const (
 	synchronousImageTaskTimeout     = 300 * time.Second
 	synchronousImageTaskMaxAttempts = 2
+	synchronousImageHeartbeat       = 30 * time.Second
+	synchronousImageStaleAfter      = 90 * time.Second
 )
 
 var synchronousImageTaskSlotsOnce sync.Once
@@ -143,6 +145,15 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	common.SysLog("任务进度轮询开始")
 	sweepTimedOutTasks(ctx)
+	recovered, recoverErr := model.RequeueStaleLocalImageTasks(
+		time.Now().Add(-synchronousImageStaleAfter).Unix(),
+		constant.TaskQueryLimit,
+	)
+	if recoverErr != nil {
+		logger.LogError(ctx, fmt.Sprintf("recover stale synchronous image tasks: %v", recoverErr))
+	} else if recovered > 0 {
+		logger.LogWarn(ctx, fmt.Sprintf("requeued %d stale synchronous image tasks after worker loss", recovered))
+	}
 	allTasks := model.GetAllUnFinishRemoteTasks(constant.TaskQueryLimit)
 	localTaskLimit := cap(synchronousImageTaskSlots()) - len(synchronousImageTaskSlots())
 	if constant.TaskQueryLimit > 0 && localTaskLimit > constant.TaskQueryLimit {
@@ -312,9 +323,29 @@ func tryStartSynchronousImageTask(task *model.Task, adaptor TaskPollingAdaptor, 
 				common.SysError("enqueue image task polling after worker completion: " + err.Error())
 			}
 		}()
-		ctx := context.Background()
-		if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
-			logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
+		workerCtx, cancelWorker := context.WithCancel(context.Background())
+		heartbeatDone := make(chan struct{})
+		gopool.Go(func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(synchronousImageHeartbeat)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					if err := model.TouchInProgressLocalImageTask(task.ID); err != nil {
+						logger.LogWarn(workerCtx, fmt.Sprintf("heartbeat synchronous image task %s: %v", task.TaskID, err))
+					}
+				}
+			}
+		})
+		defer func() {
+			cancelWorker()
+			<-heartbeatDone
+		}()
+		if err := updateLocalSingleTask(workerCtx, adaptor, executor, task); err != nil {
+			logger.LogError(workerCtx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
 		}
 	})
 	return true
