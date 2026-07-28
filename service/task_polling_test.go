@@ -318,11 +318,68 @@ func TestUpdateLocalTasksExecutesSynchronousImageTask(t *testing.T) {
 	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
 
 	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	require.Eventually(t, func() bool {
+		return task.Status == model.TaskStatusSuccess
+	}, 2*time.Second, 10*time.Millisecond)
 	assert.Equal(t, 1, executor.calls)
-	assert.Equal(t, model.TaskStatus("SUCCESS"), task.Status)
 	assert.Equal(t, "100%", task.Progress)
 	assert.Equal(t, "https://example.com/local.png", task.PrivateData.ResultURL)
 	assert.Empty(t, task.PrivateData.RequestBody)
+}
+
+func TestLocalImagePollingLoadsOnlyQueuedTasksWithinAvailableSlots(t *testing.T) {
+	truncate(t)
+	now := time.Now().Unix()
+	tasks := []*model.Task{
+		{
+			TaskID:    "task_local_queued",
+			Platform:  constant.TaskPlatformAsyncImage,
+			Status:    model.TaskStatusQueued,
+			Progress:  "10%",
+			CreatedAt: now,
+			UpdatedAt: now,
+			PrivateData: model.TaskPrivateData{
+				UpstreamMode: constant.TaskImageUpstreamModeSync,
+				RequestBody:  []byte(`{"prompt":"queued"}`),
+			},
+		},
+		{
+			TaskID:    "task_local_in_progress",
+			Platform:  constant.TaskPlatformAsyncImage,
+			Status:    model.TaskStatusInProgress,
+			Progress:  "30%",
+			CreatedAt: now,
+			UpdatedAt: now,
+			PrivateData: model.TaskPrivateData{
+				UpstreamMode: constant.TaskImageUpstreamModeSync,
+				RequestBody:  []byte(`{"prompt":"running"}`),
+			},
+		},
+		{
+			TaskID:    "task_remote_in_progress",
+			Platform:  constant.TaskPlatformAsyncImage,
+			Status:    model.TaskStatusInProgress,
+			Progress:  "30%",
+			CreatedAt: now,
+			UpdatedAt: now,
+			PrivateData: model.TaskPrivateData{
+				UpstreamMode:   constant.TaskImageUpstreamModeAsync,
+				UpstreamTaskID: "upstream_remote",
+			},
+		},
+	}
+	for _, task := range tasks {
+		require.NoError(t, model.DB.Create(task).Error)
+	}
+
+	localTasks := model.GetQueuedLocalImageTasks(1)
+	require.Len(t, localTasks, 1)
+	assert.Equal(t, "task_local_queued", localTasks[0].TaskID)
+	assert.Equal(t, []byte(`{"prompt":"queued"}`), localTasks[0].PrivateData.RequestBody)
+
+	remoteTasks := model.GetAllUnFinishRemoteTasks(10)
+	require.Len(t, remoteTasks, 1)
+	assert.Equal(t, "task_remote_in_progress", remoteTasks[0].TaskID)
 }
 
 func TestSynchronousImageConcurrencyUsesGlobalConfigurableSlots(t *testing.T) {
@@ -431,6 +488,9 @@ func TestUpdateLocalTasksTimesOutAndRetriesSynchronousImageOnce(t *testing.T) {
 	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
 
 	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	require.Eventually(t, func() bool {
+		return task.Status == model.TaskStatusSuccess
+	}, 2*time.Second, 10*time.Millisecond)
 	assert.Equal(t, 2, executor.calls)
 	require.Len(t, executor.deadlines, 2)
 	for _, remaining := range executor.deadlines {
@@ -476,6 +536,9 @@ func TestUpdateLocalTasksStopsAfterOneSynchronousImageRetry(t *testing.T) {
 	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
 
 	require.NoError(t, UpdateLocalTasks(context.Background(), constant.TaskPlatformAsyncImage, []*model.Task{task}))
+	require.Eventually(t, func() bool {
+		return task.Status == model.TaskStatusFailure
+	}, 2*time.Second, 10*time.Millisecond)
 	assert.Equal(t, 2, executor.calls)
 	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
 	assert.Equal(t, 2, task.PrivateData.LocalTaskAttempts)

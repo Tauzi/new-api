@@ -141,18 +141,25 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	common.SysLog("任务进度轮询开始")
 	sweepTimedOutTasks(ctx)
-	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
+	allTasks := model.GetAllUnFinishRemoteTasks(constant.TaskQueryLimit)
+	localTaskLimit := cap(synchronousImageTaskSlots()) - len(synchronousImageTaskSlots())
+	if constant.TaskQueryLimit > 0 && localTaskLimit > constant.TaskQueryLimit {
+		localTaskLimit = constant.TaskQueryLimit
+	}
+	localTasks := model.GetQueuedLocalImageTasks(localTaskLimit)
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	localPlatformTask := make(map[constant.TaskPlatform][]*model.Task)
 	platforms := make(map[constant.TaskPlatform]struct{})
 	for _, t := range allTasks {
 		platforms[t.Platform] = struct{}{}
-		if t.PrivateData.UpstreamMode == constant.TaskImageUpstreamModeSync && len(t.PrivateData.RequestBody) > 0 {
-			localPlatformTask[t.Platform] = append(localPlatformTask[t.Platform], t)
-			continue
-		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
+	}
+	if len(localTasks) > 0 {
+		summary.UnfinishedTasks += len(localTasks)
+		platforms[constant.TaskPlatformAsyncImage] = struct{}{}
+		localPlatformTask[constant.TaskPlatformAsyncImage] = localTasks
+		localTasks = nil
 	}
 
 	totalPlatforms := len(platforms)
@@ -175,6 +182,8 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 			if err := UpdateLocalTasks(ctx, platform, localTasks); err != nil {
 				common.SysLog(fmt.Sprintf("UpdateLocalTasks fail: %s", err))
 			}
+			delete(localPlatformTask, platform)
+			localTasks = nil
 		}
 		taskChannelM := make(map[int][]string)
 		taskM := make(map[string]*model.Task)
@@ -214,9 +223,9 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	return summary
 }
 
-// UpdateLocalTasks executes persisted tasks for synchronous upstreams. Unlike
-// remote task polling, a local task has no provider task ID and must be run
-// exactly once from its queued state in this pass.
+// UpdateLocalTasks dispatches persisted tasks for synchronous upstreams.
+// Synchronous image workers outlive the polling pass and refill available
+// slots without retaining the complete queued-task batch in memory.
 func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks []*model.Task) error {
 	if len(tasks) == 0 {
 		return nil
@@ -247,8 +256,6 @@ func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks
 		return nil
 	}
 
-	slots := synchronousImageTaskSlots()
-	var wg sync.WaitGroup
 	for _, task := range tasks {
 		if task == nil || task.Status == model.TaskStatusInProgress {
 			continue
@@ -260,25 +267,10 @@ func UpdateLocalTasks(ctx context.Context, platform constant.TaskPlatform, tasks
 			}
 			continue
 		}
-		task := task
-		select {
-		case slots <- struct{}{}:
-			wg.Add(1)
-			gopool.Go(func() {
-				defer wg.Done()
-				defer func() { <-slots }()
-				if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
-					logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))
-				}
-			})
-		case <-ctx.Done():
-			wg.Wait()
+		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-	}
-	wg.Wait()
-	if ctx.Err() != nil {
-		return ctx.Err()
+		tryStartSynchronousImageTask(task, adaptor, executor)
 	}
 	return nil
 }
@@ -300,6 +292,10 @@ func TryDispatchLocalTask(task *model.Task) bool {
 	if !ok {
 		return false
 	}
+	return tryStartSynchronousImageTask(task, adaptor, executor)
+}
+
+func tryStartSynchronousImageTask(task *model.Task, adaptor TaskPollingAdaptor, executor LocalTaskExecutor) bool {
 	slots := synchronousImageTaskSlots()
 	select {
 	case slots <- struct{}{}:
@@ -308,7 +304,12 @@ func TryDispatchLocalTask(task *model.Task) bool {
 	}
 
 	gopool.Go(func() {
-		defer func() { <-slots }()
+		defer func() {
+			<-slots
+			if _, _, err := EnqueueSystemTask(model.SystemTaskTypeAsyncTaskPoll, nil); err != nil {
+				common.SysError("enqueue image task polling after worker completion: " + err.Error())
+			}
+		}()
 		ctx := context.Background()
 		if err := updateLocalSingleTask(ctx, adaptor, executor, task); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to execute local task %s: %s", task.TaskID, err.Error()))

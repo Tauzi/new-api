@@ -318,11 +318,50 @@ func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	return tasks
 }
 
-func GetAllUnFinishSyncTasks(limit int) []*Task {
+func taskPrivateDataUpstreamModeExpression() string {
+	switch {
+	case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
+		return "private_data->>'upstream_mode'"
+	case common.UsingMainDatabase(common.DatabaseTypeMySQL):
+		return "JSON_UNQUOTE(JSON_EXTRACT(private_data, '$.upstream_mode'))"
+	default:
+		return "json_extract(private_data, '$.upstream_mode')"
+	}
+}
+
+// GetAllUnFinishRemoteTasks excludes local synchronous image jobs. Their
+// private_data contains the complete persisted request body and is loaded only
+// when a worker slot is available.
+func GetAllUnFinishRemoteTasks(limit int) []*Task {
 	var tasks []*Task
-	var err error
-	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	modeExpression := taskPrivateDataUpstreamModeExpression()
+	err := DB.Where("progress != ?", "100%").
+		Where("status NOT IN ?", []TaskStatus{TaskStatusFailure, TaskStatusSuccess}).
+		Where("platform <> ? OR COALESCE("+modeExpression+", '') <> ?", constant.TaskPlatformAsyncImage, constant.TaskImageUpstreamModeSync).
+		Limit(limit).
+		Order("id").
+		Find(&tasks).Error
+	if err != nil {
+		return nil
+	}
+	return tasks
+}
+
+// GetQueuedLocalImageTasks loads at most limit request bodies. In-progress
+// local jobs are owned by workers and must not be decoded again by polling.
+func GetQueuedLocalImageTasks(limit int) []*Task {
+	if limit <= 0 {
+		return nil
+	}
+	var tasks []*Task
+	modeExpression := taskPrivateDataUpstreamModeExpression()
+	err := DB.Where("platform = ?", constant.TaskPlatformAsyncImage).
+		Where("progress != ?", "100%").
+		Where("status NOT IN ?", []TaskStatus{TaskStatusInProgress, TaskStatusFailure, TaskStatusSuccess}).
+		Where("COALESCE("+modeExpression+", '') = ?", constant.TaskImageUpstreamModeSync).
+		Limit(limit).
+		Order("id").
+		Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
