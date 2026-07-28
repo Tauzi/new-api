@@ -121,6 +121,30 @@ func sweepTimedOutTasks(ctx context.Context) {
 	}
 }
 
+func failInterruptedSynchronousImageTasks(ctx context.Context) int {
+	cutoff := time.Now().Add(-synchronousImageStaleAfter).Unix()
+	limit := constant.TaskQueryLimit
+	if limit <= 0 {
+		limit = 1000
+	}
+	const reason = "同步生图任务因 NewAPI 重启或 worker 中断，结果无法确认"
+	tasks, err := model.FailStaleInProgressLocalImageTasks(cutoff, limit, reason)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("fail interrupted synchronous image tasks: %v", err))
+		return 0
+	}
+	if len(tasks) == 0 {
+		return 0
+	}
+
+	for _, task := range tasks {
+		if task.Quota != 0 {
+			RefundTaskQuota(ctx, task, reason)
+		}
+	}
+	return len(tasks)
+}
+
 // TaskPollSummary is the result recorded on an async_task_poll system task row,
 // summarizing one polling pass.
 type TaskPollSummary struct {
@@ -145,14 +169,8 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	common.SysLog("任务进度轮询开始")
 	sweepTimedOutTasks(ctx)
-	recovered, recoverErr := model.RequeueStaleLocalImageTasks(
-		time.Now().Add(-synchronousImageStaleAfter).Unix(),
-		constant.TaskQueryLimit,
-	)
-	if recoverErr != nil {
-		logger.LogError(ctx, fmt.Sprintf("recover stale synchronous image tasks: %v", recoverErr))
-	} else if recovered > 0 {
-		logger.LogWarn(ctx, fmt.Sprintf("requeued %d stale synchronous image tasks after worker loss", recovered))
+	if failed := failInterruptedSynchronousImageTasks(ctx); failed > 0 {
+		logger.LogWarn(ctx, fmt.Sprintf("failed and refunded %d interrupted synchronous image tasks", failed))
 	}
 	allTasks := model.GetAllUnFinishRemoteTasks(constant.TaskQueryLimit)
 	localTaskLimit := cap(synchronousImageTaskSlots()) - len(synchronousImageTaskSlots())

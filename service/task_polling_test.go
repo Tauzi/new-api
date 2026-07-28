@@ -893,6 +893,44 @@ func TestRunTaskPollingOnceDoesNotRefundHistoricalFailedTask(t *testing.T) {
 	assert.Equal(t, int64(0), countLogs(t))
 }
 
+func TestInterruptedSynchronousImageTaskFailsAndRefundsWithoutRetry(t *testing.T) {
+	truncate(t)
+
+	const userID, initialQuota, taskQuota = 405, 10_000, 1_500
+	seedUser(t, userID, initialQuota)
+	task := makeTask(userID, 0, taskQuota, 0, BillingSourceWallet, 0)
+	task.TaskID = "interrupted_synchronous_image"
+	task.Platform = constant.TaskPlatformAsyncImage
+	task.Status = model.TaskStatusInProgress
+	task.Progress = "50%"
+	task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+	task.PrivateData.UpstreamMode = constant.TaskImageUpstreamModeSync
+	task.PrivateData.RequestBody = []byte("persisted multipart request")
+	task.PrivateData.RequestContentType = "multipart/form-data"
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, model.DB.Model(&model.Task{}).
+		Where("id = ?", task.ID).
+		Update("updated_at", time.Now().Add(-2*time.Minute).Unix()).Error)
+
+	failed := failInterruptedSynchronousImageTasks(context.Background())
+	assert.Equal(t, 1, failed)
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), reloaded.Status)
+	assert.Equal(t, "100%", reloaded.Progress)
+	assert.Contains(t, reloaded.FailReason, "结果无法确认")
+	assert.Empty(t, reloaded.PrivateData.RequestBody)
+	assert.Empty(t, reloaded.PrivateData.RequestContentType)
+	assert.Zero(t, reloaded.Quota)
+	assert.Equal(t, initialQuota+taskQuota, getUserQuota(t, userID))
+	assert.Equal(t, int64(1), countLogs(t))
+
+	assert.Zero(t, failInterruptedSynchronousImageTasks(context.Background()))
+	assert.Equal(t, initialQuota+taskQuota, getUserQuota(t, userID))
+	assert.Equal(t, int64(1), countLogs(t))
+}
+
 func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 	truncate(t)
 

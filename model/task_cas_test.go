@@ -243,9 +243,10 @@ func TestClaimLocalTaskWithStatusDoesNotRewritePrivateData(t *testing.T) {
 	assert.Zero(t, reloaded.PrivateData.LocalTaskAttempts)
 }
 
-func TestRequeueStaleLocalImageTasksPreservesRequestBody(t *testing.T) {
+func TestFailStaleInProgressLocalImageTasks(t *testing.T) {
 	truncateTables(t)
 	now := time.Now().Unix()
+	const reason = "worker interrupted"
 
 	staleLocal := &Task{
 		TaskID:   "task_stale_local",
@@ -253,8 +254,9 @@ func TestRequeueStaleLocalImageTasksPreservesRequestBody(t *testing.T) {
 		Status:   TaskStatusInProgress,
 		Progress: "50%",
 		PrivateData: TaskPrivateData{
-			UpstreamMode: constant.TaskImageUpstreamModeSync,
-			RequestBody:  []byte("persisted request"),
+			UpstreamMode:       constant.TaskImageUpstreamModeSync,
+			RequestBody:        []byte("persisted request"),
+			RequestContentType: "multipart/form-data",
 		},
 	}
 	insertTask(t, staleLocal)
@@ -285,23 +287,26 @@ func TestRequeueStaleLocalImageTasksPreservesRequestBody(t *testing.T) {
 	insertTask(t, staleRemote)
 	require.NoError(t, DB.Model(&Task{}).Where("id = ?", staleRemote.ID).Update("updated_at", now-120).Error)
 
-	requeued, err := RequeueStaleLocalImageTasks(now-90, 10)
+	failedTasks, err := FailStaleInProgressLocalImageTasks(now-90, 10, reason)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), requeued)
+	require.Len(t, failedTasks, 1)
+	assert.Equal(t, staleLocal.ID, failedTasks[0].ID)
+	assert.Equal(t, TaskStatus(TaskStatusFailure), failedTasks[0].Status)
+	assert.Equal(t, "100%", failedTasks[0].Progress)
+	assert.Equal(t, reason, failedTasks[0].FailReason)
+	assert.NotZero(t, failedTasks[0].FinishTime)
+	assert.Empty(t, failedTasks[0].PrivateData.RequestBody)
+	assert.Empty(t, failedTasks[0].PrivateData.RequestContentType)
 
-	var recovered Task
-	require.NoError(t, DB.First(&recovered, staleLocal.ID).Error)
-	assert.Equal(t, TaskStatus(TaskStatusQueued), recovered.Status)
-	assert.Equal(t, "10%", recovered.Progress)
-	assert.Equal(t, []byte("persisted request"), recovered.PrivateData.RequestBody)
+	var recent Task
+	require.NoError(t, DB.First(&recent, recentLocal.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusInProgress), recent.Status)
+	assert.Equal(t, []byte("active request"), recent.PrivateData.RequestBody)
 
-	var stillRunning Task
-	require.NoError(t, DB.First(&stillRunning, recentLocal.ID).Error)
-	assert.Equal(t, TaskStatus(TaskStatusInProgress), stillRunning.Status)
-
-	var stillRemote Task
-	require.NoError(t, DB.First(&stillRemote, staleRemote.ID).Error)
-	assert.Equal(t, TaskStatus(TaskStatusInProgress), stillRemote.Status)
+	var remote Task
+	require.NoError(t, DB.First(&remote, staleRemote.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusInProgress), remote.Status)
+	assert.Equal(t, "upstream_task", remote.PrivateData.UpstreamTaskID)
 }
 
 func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {

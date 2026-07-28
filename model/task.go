@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -368,12 +369,11 @@ func GetQueuedLocalImageTasks(limit int) []*Task {
 	return tasks
 }
 
-// RequeueStaleLocalImageTasks recovers workers lost when a process exits. The
-// second UPDATE condition prevents requeueing a task whose live worker renewed
-// its heartbeat after the candidate query.
-func RequeueStaleLocalImageTasks(cutoff int64, limit int) (int64, error) {
+// FailStaleInProgressLocalImageTasks atomically terminalizes workers that lost
+// their heartbeat and removes persisted request bodies before loading them for refunds.
+func FailStaleInProgressLocalImageTasks(cutoff int64, limit int, reason string) ([]*Task, error) {
 	if limit <= 0 {
-		return 0, nil
+		return nil, nil
 	}
 	modeExpression := taskPrivateDataUpstreamModeExpression()
 	var ids []int64
@@ -386,19 +386,34 @@ func RequeueStaleLocalImageTasks(cutoff int64, limit int) (int64, error) {
 		Limit(limit).
 		Pluck("id", &ids).Error
 	if err != nil || len(ids) == 0 {
-		return 0, err
+		return nil, err
 	}
 
+	privateDataWithoutRequest := "json_remove(private_data, '$.request_body', '$.request_content_type')"
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		privateDataWithoutRequest = "(private_data::jsonb - 'request_body' - 'request_content_type')::json"
+	} else if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		privateDataWithoutRequest = "JSON_REMOVE(private_data, '$.request_body', '$.request_content_type')"
+	}
 	now := time.Now().Unix()
 	result := DB.Model(&Task{}).
 		Where("id IN ? AND status = ? AND updated_at < ?", ids, TaskStatusInProgress, cutoff).
 		Updates(map[string]any{
-			"status":      TaskStatusQueued,
-			"progress":    "10%",
-			"fail_reason": "",
-			"updated_at":  now,
+			"status":       TaskStatusFailure,
+			"progress":     "100%",
+			"finish_time":  now,
+			"fail_reason":  reason,
+			"private_data": gorm.Expr(privateDataWithoutRequest),
+			"updated_at":   now,
 		})
-	return result.RowsAffected, result.Error
+	if result.Error != nil || result.RowsAffected == 0 {
+		return nil, result.Error
+	}
+
+	var tasks []*Task
+	err = DB.Where("id IN ? AND status = ? AND finish_time = ? AND fail_reason = ?", ids, TaskStatusFailure, now, reason).
+		Find(&tasks).Error
+	return tasks, err
 }
 
 func TouchInProgressLocalImageTask(id int64) error {
