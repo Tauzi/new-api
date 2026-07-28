@@ -1,6 +1,6 @@
 package constant
 
-const DefaultAsyncImageWorkerSlots = 50
+const DefaultAsyncImageWorkerSlots = 20
 
 var StreamingTimeout int
 var DifyDebug bool

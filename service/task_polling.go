@@ -326,6 +326,7 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 
 	isSynchronousImageTask := task.Platform == constant.TaskPlatformAsyncImage &&
 		task.PrivateData.UpstreamMode == constant.TaskImageUpstreamModeSync
+	claimed := false
 	for {
 		previousStatus := task.Status
 		now := time.Now().Unix()
@@ -337,12 +338,20 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 		if isSynchronousImageTask {
 			task.PrivateData.LocalTaskAttempts++
 		}
-		won, err := task.UpdateWithStatus(previousStatus)
-		if err != nil {
-			return fmt.Errorf("claim local task %s: %w", task.TaskID, err)
-		}
-		if !won {
-			return nil
+		if !claimed {
+			var won bool
+			if isSynchronousImageTask {
+				won, err = task.ClaimLocalTaskWithStatus(previousStatus)
+			} else {
+				won, err = task.UpdateWithStatus(previousStatus)
+			}
+			if err != nil {
+				return fmt.Errorf("claim local task %s: %w", task.TaskID, err)
+			}
+			if !won {
+				return nil
+			}
+			claimed = true
 		}
 
 		attemptCtx := ctx
@@ -359,16 +368,7 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 				retryable = true
 			}
 			if isSynchronousImageTask && ctx.Err() == nil && retryable && task.PrivateData.LocalTaskAttempts < synchronousImageTaskMaxAttempts {
-				task.Status = model.TaskStatusQueued
-				task.Progress = taskcommon.ProgressQueued
 				task.FailReason = ""
-				requeued, updateErr := task.UpdateWithStatus(model.TaskStatusInProgress)
-				if updateErr != nil {
-					return fmt.Errorf("requeue local task %s for retry: %w", task.TaskID, updateErr)
-				}
-				if !requeued {
-					return nil
-				}
 				logger.LogWarn(ctx, fmt.Sprintf(
 					"Synchronous image task %s attempt %d failed, retrying once: %s",
 					task.TaskID,

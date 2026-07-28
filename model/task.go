@@ -491,6 +491,25 @@ func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 	return result.RowsAffected > 0, nil
 }
 
+// ClaimLocalTaskWithStatus updates only worker-claim fields. The persisted
+// request body can be tens of megabytes, so rewriting private_data merely to
+// record an attempt would create another large MVCC/TOAST row version.
+func (t *Task) ClaimLocalTaskWithStatus(fromStatus TaskStatus) (bool, error) {
+	t.UpdatedAt = time.Now().Unix()
+	result := DB.Model(&Task{}).
+		Where("id = ? AND status = ?", t.ID, fromStatus).
+		Updates(map[string]any{
+			"status":     t.Status,
+			"progress":   t.Progress,
+			"start_time": t.StartTime,
+			"updated_at": t.UpdatedAt,
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
 // WARNING: This function has NO CAS (Compare-And-Swap) guard — it will overwrite
 // any concurrent status changes. DO NOT use in billing/quota lifecycle flows

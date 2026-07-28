@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -208,6 +209,38 @@ func TestUpdateWithStatus_Lose(t *testing.T) {
 	var reloaded Task
 	require.NoError(t, DB.First(&reloaded, task.ID).Error)
 	assert.EqualValues(t, TaskStatusFailure, reloaded.Status) // unchanged
+}
+
+func TestClaimLocalTaskWithStatusDoesNotRewritePrivateData(t *testing.T) {
+	truncateTables(t)
+
+	originalBody := []byte("large persisted multipart body")
+	task := &Task{
+		TaskID:   "task_local_claim",
+		Status:   TaskStatusQueued,
+		Progress: "10%",
+		PrivateData: TaskPrivateData{
+			UpstreamMode:      constant.TaskImageUpstreamModeSync,
+			RequestBody:       originalBody,
+			LocalTaskAttempts: 0,
+		},
+	}
+	insertTask(t, task)
+
+	task.Status = TaskStatusInProgress
+	task.Progress = "30%"
+	task.StartTime = time.Now().Unix()
+	task.PrivateData.LocalTaskAttempts = 1
+	won, err := task.ClaimLocalTaskWithStatus(TaskStatusQueued)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	var reloaded Task
+	require.NoError(t, DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, TaskStatus(TaskStatusInProgress), reloaded.Status)
+	assert.Equal(t, "30%", reloaded.Progress)
+	assert.Equal(t, originalBody, reloaded.PrivateData.RequestBody)
+	assert.Zero(t, reloaded.PrivateData.LocalTaskAttempts)
 }
 
 func TestUpdateWithStatus_ConcurrentWinner(t *testing.T) {
