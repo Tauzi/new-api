@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -350,15 +352,24 @@ func (a *TaskAdaptor) ExecuteLocalTask(ctx context.Context, task *model.Task, ch
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if isRetryableSynchronousImageTransportError(err) {
+			return nil, nil, &service.RetryableLocalTaskError{Err: err}
+		}
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if isRetryableSynchronousImageTransportError(err) {
+			return nil, nil, &service.RetryableLocalTaskError{Err: err}
+		}
 		return nil, nil, err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		statusErr := fmt.Errorf("upstream image request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		if resp.StatusCode == http.StatusGatewayTimeout {
+			return nil, responseBody, &service.RetryableLocalTaskError{Err: statusErr}
+		}
 		return nil, responseBody, statusErr
 	}
 	responseBody, err = service.RewriteImageResponseURLs(responseBody, ch.GetOtherSettings())
@@ -382,6 +393,31 @@ func (a *TaskAdaptor) ExecuteLocalTask(ctx context.Context, task *model.Task, ch
 		Progress: taskcommon.ProgressComplete,
 		Url:      response.Data[0].Url,
 	}, responseBody, nil
+}
+
+func isRetryableSynchronousImageTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"broken pipe",
+		"connection aborted",
+		"connection closed",
+		"connection reset",
+		"server closed idle connection",
+		"use of closed connection",
+		"use of closed network connection",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +43,11 @@ type timeoutThenSuccessLocalTaskExecutor struct {
 	localTaskExecutorAdaptor
 	timeoutFailures int
 	deadlines       []time.Duration
+}
+
+type scriptedLocalTaskExecutor struct {
+	localTaskExecutorAdaptor
+	failures []error
 }
 
 type blockingLocalTaskExecutor struct {
@@ -148,6 +154,19 @@ func (a *timeoutThenSuccessLocalTaskExecutor) ExecuteLocalTask(ctx context.Conte
 	}, []byte(`{"data":[{"url":"https://example.com/retried.png"}]}`), nil
 }
 
+func (a *scriptedLocalTaskExecutor) ExecuteLocalTask(_ context.Context, task *model.Task, _ *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
+	a.calls++
+	if a.calls <= len(a.failures) {
+		return nil, []byte(`{"error":{"message":"upstream failed"}}`), a.failures[a.calls-1]
+	}
+	return &relaycommon.TaskInfo{
+		TaskID:   task.TaskID,
+		Status:   string(model.TaskStatusSuccess),
+		Progress: "100%",
+		Url:      "https://example.com/retried.png",
+	}, []byte(`{"data":[{"url":"https://example.com/retried.png"}]}`), nil
+}
+
 func (a *blockingLocalTaskExecutor) ExecuteLocalTask(_ context.Context, task *model.Task, _ *model.Channel) (*relaycommon.TaskInfo, []byte, error) {
 	a.mu.Lock()
 	a.active++
@@ -174,6 +193,71 @@ func (a *blockingLocalTaskExecutor) maxConcurrency() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.maxActive
+}
+
+func TestExecuteSynchronousImageTaskRetriesOnlyOneTransientFailure(t *testing.T) {
+	retryable := func(message string) error {
+		return &RetryableLocalTaskError{Err: errors.New(message)}
+	}
+	tests := []struct {
+		name         string
+		failures     []error
+		wantCalls    int
+		wantAttempts int
+		wantError    bool
+	}{
+		{
+			name:         "transient failure then success",
+			failures:     []error{retryable("gateway timeout")},
+			wantCalls:    2,
+			wantAttempts: 2,
+		},
+		{
+			name:         "second transient failure is final",
+			failures:     []error{retryable("gateway timeout"), retryable("connection reset")},
+			wantCalls:    2,
+			wantAttempts: 2,
+			wantError:    true,
+		},
+		{
+			name:         "non retryable failure",
+			failures:     []error{errors.New("status 400")},
+			wantCalls:    1,
+			wantAttempts: 1,
+			wantError:    true,
+		},
+		{
+			name:         "worker timeout",
+			failures:     []error{context.DeadlineExceeded},
+			wantCalls:    1,
+			wantAttempts: 1,
+			wantError:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &scriptedLocalTaskExecutor{failures: tt.failures}
+			task := &model.Task{TaskID: "task_retry_policy"}
+			result, _, err := executeSynchronousImageTask(
+				context.Background(),
+				executor,
+				task,
+				&model.Channel{},
+				0,
+			)
+
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+			}
+			assert.Equal(t, tt.wantCalls, executor.calls)
+			assert.Equal(t, tt.wantAttempts, task.PrivateData.LocalTaskAttempts)
+		})
+	}
 }
 
 func (a *sunoFailurePollingAdaptor) Init(_ *relaycommon.RelayInfo) {}

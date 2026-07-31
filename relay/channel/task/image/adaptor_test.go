@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	stdimage "image"
 	"image/color"
@@ -169,12 +170,14 @@ func TestExecuteLocalTaskParsesSynchronousImageResponse(t *testing.T) {
 
 func TestExecuteLocalTaskReturnsHTTPStatusErrors(t *testing.T) {
 	tests := []struct {
-		name   string
-		status int
+		name          string
+		status        int
+		wantRetryable bool
 	}{
 		{name: "bad request", status: http.StatusBadRequest},
 		{name: "rate limit", status: http.StatusTooManyRequests},
 		{name: "server error", status: http.StatusInternalServerError},
+		{name: "gateway timeout", status: http.StatusGatewayTimeout, wantRetryable: true},
 	}
 
 	for _, tt := range tests {
@@ -199,6 +202,28 @@ func TestExecuteLocalTaskReturnsHTTPStatusErrors(t *testing.T) {
 			_, _, err := (&TaskAdaptor{}).ExecuteLocalTask(context.Background(), task, ch)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, fmt.Sprintf("status %d", tt.status))
+			var retryableErr *service.RetryableLocalTaskError
+			assert.Equal(t, tt.wantRetryable, errors.As(err, &retryableErr))
+		})
+	}
+}
+
+func TestRetryableSynchronousImageTransportErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "eof", err: fmt.Errorf("request failed: %w", io.EOF), want: true},
+		{name: "unexpected eof", err: fmt.Errorf("read failed: %w", io.ErrUnexpectedEOF), want: true},
+		{name: "closed connection", err: errors.New("read: connection reset by peer"), want: true},
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "validation", err: errors.New("invalid request")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isRetryableSynchronousImageTransportError(tt.err))
 		})
 	}
 }

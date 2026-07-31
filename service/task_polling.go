@@ -40,12 +40,27 @@ type LocalTaskExecutor interface {
 	ExecuteLocalTask(ctx context.Context, task *model.Task, ch *model.Channel) (*relaycommon.TaskInfo, []byte, error)
 }
 
+// RetryableLocalTaskError marks a transient synchronous-upstream failure that
+// the local task worker may retry once without changing task or billing state.
+type RetryableLocalTaskError struct {
+	Err error
+}
+
+func (e *RetryableLocalTaskError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RetryableLocalTaskError) Unwrap() error {
+	return e.Err
+}
+
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
 const (
 	synchronousImageTaskTimeout = 300 * time.Second
+	synchronousImageRetryDelay  = 2 * time.Second
 	synchronousImageHeartbeat   = 30 * time.Second
 	synchronousImageStaleAfter  = 90 * time.Second
 )
@@ -391,9 +406,6 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 	if task.StartTime == 0 {
 		task.StartTime = now
 	}
-	if isSynchronousImageTask {
-		task.PrivateData.LocalTaskAttempts++
-	}
 	var won bool
 	if isSynchronousImageTask {
 		won, err = task.ClaimLocalTaskWithStatus(previousStatus)
@@ -416,13 +428,27 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 		}()
 	}
 
-	attemptCtx := ctx
-	cancelAttempt := func() {}
+	taskCtx := ctx
+	cancelTask := func() {}
 	if isSynchronousImageTask {
-		attemptCtx, cancelAttempt = context.WithTimeout(ctx, synchronousImageTaskTimeout)
+		taskCtx, cancelTask = context.WithTimeout(ctx, synchronousImageTaskTimeout)
 	}
-	taskResult, responseBody, executeErr := executor.ExecuteLocalTask(attemptCtx, task, ch)
-	cancelAttempt()
+	defer cancelTask()
+
+	var taskResult *relaycommon.TaskInfo
+	var responseBody []byte
+	var executeErr error
+	if isSynchronousImageTask {
+		taskResult, responseBody, executeErr = executeSynchronousImageTask(
+			taskCtx,
+			executor,
+			task,
+			ch,
+			synchronousImageRetryDelay,
+		)
+	} else {
+		taskResult, responseBody, executeErr = executor.ExecuteLocalTask(taskCtx, task, ch)
+	}
 	if executeErr != nil {
 		failureReason := executeErr.Error()
 		if errors.Is(executeErr, context.DeadlineExceeded) {
@@ -480,6 +506,37 @@ func updateLocalSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, exec
 		RefundTaskQuota(ctx, task, task.FailReason)
 	}
 	return nil
+}
+
+func executeSynchronousImageTask(
+	ctx context.Context,
+	executor LocalTaskExecutor,
+	task *model.Task,
+	ch *model.Channel,
+	retryDelay time.Duration,
+) (*relaycommon.TaskInfo, []byte, error) {
+	task.PrivateData.LocalTaskAttempts++
+	taskResult, responseBody, err := executor.ExecuteLocalTask(ctx, task, ch)
+	var retryableErr *RetryableLocalTaskError
+	if err == nil || !errors.As(err, &retryableErr) {
+		return taskResult, responseBody, err
+	}
+
+	logger.LogWarn(ctx, fmt.Sprintf(
+		"retry synchronous image task %s once after transient upstream failure: %v",
+		task.TaskID,
+		err,
+	))
+	timer := time.NewTimer(retryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, responseBody, ctx.Err()
+	case <-timer.C:
+	}
+
+	task.PrivateData.LocalTaskAttempts++
+	return executor.ExecuteLocalTask(ctx, task, ch)
 }
 
 func failLocalTask(ctx context.Context, task *model.Task, reason string, responseBody []byte) error {
