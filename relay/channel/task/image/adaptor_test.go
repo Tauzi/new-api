@@ -428,6 +428,42 @@ func TestPrepareLocalMultipartTaskSpoolsRepeatedImages(t *testing.T) {
 	assert.Len(t, form.File["image"], 2)
 }
 
+func TestBuildMultipartBodySpoolsOutboundRequestToDisk(t *testing.T) {
+	var original bytes.Buffer
+	writer := multipart.NewWriter(&original)
+	require.NoError(t, writer.WriteField("model", testModel))
+	require.NoError(t, writer.WriteField("prompt", "stream this image"))
+	require.NoError(t, writer.WriteField("async", "true"))
+	part, err := writer.CreateFormFile("image", "input.png")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("image-data"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(original.Bytes()))
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	t.Cleanup(func() { common.CleanupBodyStorage(c) })
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesEdits,
+		OriginModelName: testModel,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: testModel,
+		},
+	}
+
+	reader, err := (&TaskAdaptor{}).BuildRequestBody(c, info)
+	require.NoError(t, err)
+	storage, ok := reader.(common.BodyStorage)
+	require.True(t, ok)
+	defer storage.Close()
+	assert.True(t, storage.IsDisk())
+	assert.Equal(t, storage.Size(), info.UpstreamRequestBodySize)
+	rebuilt, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Contains(t, string(rebuilt), "image-data")
+}
+
 func TestValidateMultipartMask(t *testing.T) {
 	buildContext := func(t *testing.T, input, mask []byte) *gin.Context {
 		var body bytes.Buffer

@@ -198,6 +198,11 @@ func getModelFromRequest(c *gin.Context) (*ModelRequest, error) {
 		return modelRequest, nil
 	}
 	if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/images/") || c.Request.URL.Path == "/v1/edits" {
+			if _, err := common.GetBodyStorageOnDisk(c); err != nil {
+				return nil, errors.New(i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+			}
+		}
 		form, err := common.ParseMultipartFormReusable(c)
 		if err != nil {
 			return nil, errors.New(i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))

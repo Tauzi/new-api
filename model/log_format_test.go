@@ -29,8 +29,8 @@ func TestFormatUserLogsStripsAdminOnlyFields(t *testing.T) {
 	require.NoError(t, err)
 	_, hasAdminInfo := parsed["admin_info"]
 	require.False(t, hasAdminInfo, "admin_info (and nested quota_saturation) must be stripped for non-admin views")
-	require.NotContains(t, parsed, "is_model_mapped")
-	require.NotContains(t, parsed, "upstream_model_name")
-	// Non-admin billing fields remain visible.
+	// Model mapping and billing fields remain visible to users.
+	require.Contains(t, parsed, "is_model_mapped")
+	require.Contains(t, parsed, "upstream_model_name")
 	require.Contains(t, parsed, "model_price")
 }

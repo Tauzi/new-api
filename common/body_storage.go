@@ -302,6 +302,17 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 	return storage, nil
 }
 
+// CreateDiskBodyStorageFromReader always streams the reader into a temporary
+// file. It is used for multipart payloads whose file parts must never be
+// materialized as one large in-memory buffer.
+func CreateDiskBodyStorageFromReader(reader io.Reader, maxBytes int64) (BodyStorage, error) {
+	storage, err := newDiskStorageFromReader(reader, maxBytes, GetDiskCachePath())
+	if err != nil {
+		return nil, err
+	}
+	return storage, nil
+}
+
 // ReaderOnly wraps an io.Reader to hide io.Closer, preventing http.NewRequest
 // from type-asserting io.ReadCloser and closing the underlying BodyStorage.
 func ReaderOnly(r io.Reader) io.Reader {

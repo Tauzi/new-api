@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	stdimage "image"
 	"image/png"
 	"io"
 	"mime/multipart"
@@ -112,6 +114,11 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *TaskAdaptor) buildRequestBody(c *gin.Context, info *relaycommon.RelayInfo, upstreamAsync bool) (io.Reader, error) {
+	contentType := c.GetHeader("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return a.buildMultipartBody(c, info, upstreamAsync)
+	}
+
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return nil, fmt.Errorf("get request body: %w", err)
@@ -119,11 +126,6 @@ func (a *TaskAdaptor) buildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	body, err := storage.Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("read request body: %w", err)
-	}
-
-	contentType := c.GetHeader("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return a.buildMultipartBody(c, info, upstreamAsync)
 	}
 
 	var fields map[string]json.RawMessage
@@ -158,13 +160,33 @@ func (a *TaskAdaptor) buildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 }
 
 func (a *TaskAdaptor) buildMultipartBody(c *gin.Context, info *relaycommon.RelayInfo, upstreamAsync bool) (io.Reader, error) {
-	var body bytes.Buffer
-	contentType, err := a.writeMultipartBody(c, info, upstreamAsync, &body)
+	form, err := imageMultipartForm(c)
 	if err != nil {
 		return nil, err
 	}
-	c.Set("image_task_content_type", contentType)
-	return &body, nil
+	requestStorage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, err
+	}
+	pipeReader, pipeWriter := io.Pipe()
+	writer := multipart.NewWriter(pipeWriter)
+	c.Set("image_task_content_type", writer.FormDataContentType())
+	go func() {
+		writeErr := a.writeMultipartForm(info, upstreamAsync, form, writer)
+		if writeErr == nil {
+			writeErr = writer.Close()
+		}
+		_ = pipeWriter.CloseWithError(writeErr)
+	}()
+	// Keep Content-Length compatibility for upstreams that reject chunked
+	// multipart requests while still avoiding a full in-memory buffer.
+	outboundStorage, err := common.CreateDiskBodyStorageFromReader(pipeReader, requestStorage.Size()+(1<<20))
+	_ = pipeReader.Close()
+	if err != nil {
+		return nil, err
+	}
+	info.UpstreamRequestBodySize = outboundStorage.Size()
+	return outboundStorage, nil
 }
 
 func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.RelayInfo, upstreamAsync bool, dst io.Writer) (string, error) {
@@ -174,20 +196,30 @@ func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.Relay
 	}
 
 	writer := multipart.NewWriter(dst)
-	model, err := resolveMultipartModel(info, form.Value)
-	if err != nil {
+	if err := a.writeMultipartForm(info, upstreamAsync, form, writer); err != nil {
 		return "", err
 	}
-	if err := writer.WriteField("model", model); err != nil {
+	if err := writer.Close(); err != nil {
 		return "", err
+	}
+	return writer.FormDataContentType(), nil
+}
+
+func (a *TaskAdaptor) writeMultipartForm(info *relaycommon.RelayInfo, upstreamAsync bool, form *multipart.Form, writer *multipart.Writer) error {
+	model, err := resolveMultipartModel(info, form.Value)
+	if err != nil {
+		return err
+	}
+	if err := writer.WriteField("model", model); err != nil {
+		return err
 	}
 	if upstreamAsync {
 		if err := writer.WriteField("async", "true"); err != nil {
-			return "", err
+			return err
 		}
 	}
 	if err := writer.WriteField("n", "1"); err != nil {
-		return "", err
+		return err
 	}
 	formValues := url.Values(form.Value)
 	quality := strings.TrimSpace(formValues.Get("quality"))
@@ -195,12 +227,12 @@ func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.Relay
 		quality = "medium"
 	}
 	if err := writer.WriteField("quality", quality); err != nil {
-		return "", err
+		return err
 	}
 	for _, key := range []string{"image_size", "output_resolution"} {
 		if value := formValues.Get(key); value != "" {
 			if err := writer.WriteField(key, value); err != nil {
-				return "", err
+				return err
 			}
 		}
 	}
@@ -211,7 +243,7 @@ func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.Relay
 		}
 		for _, value := range values {
 			if err := writer.WriteField(key, value); err != nil {
-				return "", err
+				return err
 			}
 		}
 	}
@@ -219,20 +251,20 @@ func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.Relay
 		for _, header := range headers {
 			file, err := header.Open()
 			if err != nil {
-				return "", err
+				return err
 			}
 			if header.Size > maxImageBytes {
 				_ = file.Close()
-				return "", fmt.Errorf("multipart file %s exceeds %d MB", header.Filename, maxImageBytes/(1<<20))
+				return fmt.Errorf("multipart file %s exceeds %d MB", header.Filename, maxImageBytes/(1<<20))
 			}
 			prefix, readErr := io.ReadAll(io.LimitReader(file, 512))
 			if readErr != nil {
 				_ = file.Close()
-				return "", readErr
+				return readErr
 			}
 			if _, err := file.Seek(0, io.SeekStart); err != nil {
 				_ = file.Close()
-				return "", err
+				return err
 			}
 			mimeType := header.Header.Get("Content-Type")
 			if mimeType == "" || mimeType == "application/octet-stream" {
@@ -244,25 +276,22 @@ func (a *TaskAdaptor) writeMultipartBody(c *gin.Context, info *relaycommon.Relay
 			part, err := writer.CreatePart(partHeader)
 			if err != nil {
 				_ = file.Close()
-				return "", err
+				return err
 			}
 			written, copyErr := io.Copy(part, io.LimitReader(file, maxImageBytes+1))
 			closeErr := file.Close()
 			if copyErr != nil {
-				return "", copyErr
+				return copyErr
 			}
 			if closeErr != nil {
-				return "", closeErr
+				return closeErr
 			}
 			if written > maxImageBytes {
-				return "", fmt.Errorf("multipart file %s exceeds %d MB", header.Filename, maxImageBytes/(1<<20))
+				return fmt.Errorf("multipart file %s exceeds %d MB", header.Filename, maxImageBytes/(1<<20))
 			}
 		}
 	}
-	if err := writer.Close(); err != nil {
-		return "", err
-	}
-	return writer.FormDataContentType(), nil
+	return nil
 }
 
 func (a *TaskAdaptor) PrepareLocalTask(c *gin.Context, info *relaycommon.RelayInfo) (*channel.LocalTaskData, bool, error) {
@@ -421,7 +450,13 @@ func isRetryableSynchronousImageTransportError(err error) bool {
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (*http.Response, error) {
-	return channel.DoTaskApiRequest(a, c, info, requestBody)
+	resp, err := channel.DoTaskApiRequest(a, c, info, requestBody)
+	if err != nil {
+		if closer, ok := requestBody.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	return resp, err
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (string, []byte, *dto.TaskError) {
@@ -523,6 +558,10 @@ func (a *TaskAdaptor) GetChannelName() string {
 }
 
 func validateRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
+	contentType := c.GetHeader("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return validateMultipartRequest(c, info)
+	}
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return err
@@ -530,10 +569,6 @@ func validateRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
 	body, err := storage.Bytes()
 	if err != nil {
 		return err
-	}
-	contentType := c.GetHeader("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		return validateMultipartRequest(c, info)
 	}
 	var fields map[string]json.RawMessage
 	if err := common.Unmarshal(body, &fields); err != nil {
@@ -621,6 +656,9 @@ func validateMultipartRequest(c *gin.Context, info *relaycommon.RelayInfo) error
 func imageMultipartForm(c *gin.Context) (*multipart.Form, error) {
 	if c.Request.MultipartForm != nil {
 		return c.Request.MultipartForm, nil
+	}
+	if _, err := common.GetBodyStorageOnDisk(c); err != nil {
+		return nil, err
 	}
 	form, err := common.ParseMultipartFormReusable(c)
 	if err != nil {
@@ -711,14 +749,11 @@ func validateMultipartMask(form *multipart.Form) error {
 		return nil
 	}
 
-	maskBytes, err := readMultipartFile(maskFiles[0])
+	maskConfig, maskHasAlpha, err := readMultipartPNGMetadata(maskFiles[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("decode mask PNG: %w", err)
 	}
-	if http.DetectContentType(maskBytes) != "image/png" {
-		return fmt.Errorf("mask must be a PNG file")
-	}
-	if !pngHasAlpha(maskBytes) {
+	if !maskHasAlpha {
 		return fmt.Errorf("mask PNG must contain an alpha channel")
 	}
 
@@ -729,18 +764,7 @@ func validateMultipartMask(form *multipart.Form) error {
 	if len(inputFiles) == 0 {
 		return nil
 	}
-	inputBytes, err := readMultipartFile(inputFiles[0])
-	if err != nil {
-		return err
-	}
-	if http.DetectContentType(inputBytes) != "image/png" {
-		return fmt.Errorf("mask and first input image must use the same PNG format")
-	}
-	maskConfig, err := png.DecodeConfig(bytes.NewReader(maskBytes))
-	if err != nil {
-		return fmt.Errorf("decode mask PNG: %w", err)
-	}
-	inputConfig, err := png.DecodeConfig(bytes.NewReader(inputBytes))
+	inputConfig, _, err := readMultipartPNGMetadata(inputFiles[0])
 	if err != nil {
 		return fmt.Errorf("decode first input PNG: %w", err)
 	}
@@ -750,29 +774,65 @@ func validateMultipartMask(form *multipart.Form) error {
 	return nil
 }
 
-func readMultipartFile(header *multipart.FileHeader) ([]byte, error) {
+func readMultipartPNGMetadata(header *multipart.FileHeader) (config stdimage.Config, hasAlpha bool, err error) {
 	file, err := header.Open()
 	if err != nil {
-		return nil, err
+		return config, false, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxImageBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxImageBytes {
-		return nil, fmt.Errorf("multipart file %s exceeds %d MB", header.Filename, maxImageBytes/(1<<20))
-	}
-	return data, nil
-}
 
-func pngHasAlpha(data []byte) bool {
-	// PNG IHDR color types 4 and 6 include alpha. Indexed PNGs may carry
-	// transparency in a tRNS chunk.
-	if len(data) > 25 && (data[25] == 4 || data[25] == 6) {
-		return true
+	prefix := make([]byte, 512)
+	n, readErr := io.ReadFull(file, prefix)
+	if readErr != nil && readErr != io.ErrUnexpectedEOF {
+		return config, false, readErr
 	}
-	return bytes.Contains(data, []byte("tRNS"))
+	if http.DetectContentType(prefix[:n]) != "image/png" {
+		return config, false, fmt.Errorf("file must use PNG format")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return config, false, err
+	}
+	config, err = png.DecodeConfig(file)
+	if err != nil {
+		return config, false, err
+	}
+	if _, err := file.Seek(8, io.SeekStart); err != nil {
+		return config, false, err
+	}
+
+	var chunkHeader [8]byte
+	for {
+		if _, err := io.ReadFull(file, chunkHeader[:]); err != nil {
+			return config, false, err
+		}
+		chunkLength := int64(binary.BigEndian.Uint32(chunkHeader[:4]))
+		chunkType := string(chunkHeader[4:])
+		if chunkType == "IHDR" {
+			var ihdr [13]byte
+			if chunkLength != int64(len(ihdr)) {
+				return config, false, fmt.Errorf("invalid IHDR chunk")
+			}
+			if _, err := io.ReadFull(file, ihdr[:]); err != nil {
+				return config, false, err
+			}
+			if ihdr[9] == 4 || ihdr[9] == 6 {
+				return config, true, nil
+			}
+			if _, err := file.Seek(4, io.SeekCurrent); err != nil {
+				return config, false, err
+			}
+			continue
+		}
+		if chunkType == "tRNS" {
+			return config, true, nil
+		}
+		if chunkType == "IDAT" || chunkType == "IEND" {
+			return config, false, nil
+		}
+		if _, err := file.Seek(chunkLength+4, io.SeekCurrent); err != nil {
+			return config, false, err
+		}
+	}
 }
 
 func rawString(value json.RawMessage) (string, bool) {
