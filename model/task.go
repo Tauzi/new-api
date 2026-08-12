@@ -2,6 +2,7 @@ package model
 
 import (
 	"bytes"
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"time"
@@ -253,7 +254,7 @@ func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQ
 	}
 
 	// 获取数据
-	err = query.Omit("channel_id").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
+	err = query.Omit("channel_id", "data", "private_data").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -298,12 +299,41 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	}
 
 	// 获取数据
-	err = query.Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
+	err = query.Omit("data", "private_data").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
 
 	return tasks
+}
+
+// ClearExpiredTerminalTaskDataBatch removes only expired result payloads. It
+// first selects IDs so PostgreSQL does not load the data TOAST values and so a
+// large initial cleanup can be split into short transactions.
+func ClearExpiredTerminalTaskDataBatch(ctx context.Context, cutoffUnix int64, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+
+	var ids []int64
+	err := DB.WithContext(ctx).
+		Model(&Task{}).
+		Select("id").
+		Where("status IN ?", []TaskStatus{TaskStatusSuccess, TaskStatusFailure}).
+		Where("data IS NOT NULL").
+		Where("(finish_time > 0 AND finish_time <= ?) OR (COALESCE(finish_time, 0) = 0 AND submit_time <= ?)", cutoffUnix, cutoffUnix).
+		Order("id").
+		Limit(limit).
+		Pluck("id", &ids).Error
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+
+	result := DB.WithContext(ctx).
+		Model(&Task{}).
+		Where("id IN ?", ids).
+		UpdateColumn("data", nil)
+	return result.RowsAffected, result.Error
 }
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {

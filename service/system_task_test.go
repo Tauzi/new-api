@@ -107,6 +107,49 @@ func TestSystemTaskSchedulerSkipsDisabled(t *testing.T) {
 	assert.Equal(t, int64(0), countSystemTasks(t, handler.taskType))
 }
 
+func TestTaskDataCleanupHandlerClearsExpiredResultWithoutDeletingTask(t *testing.T) {
+	truncate(t)
+
+	imageTask := &model.Task{
+		TaskID:     "expired-image-result",
+		UserId:     17,
+		ChannelId:  29,
+		Status:     model.TaskStatusSuccess,
+		SubmitTime: time.Now().Add(-5 * time.Hour).Unix(),
+		FinishTime: time.Now().Add(-4 * time.Hour).Unix(),
+		FailReason: "metadata remains",
+	}
+	imageTask.SetData(map[string]any{"b64_json": "large-result"})
+	require.NoError(t, model.DB.Create(imageTask).Error)
+
+	systemTask, err := model.CreateSystemTask(model.SystemTaskTypeTaskDataCleanup, nil, nil)
+	require.NoError(t, err)
+	const runnerID = "task-data-cleanup-runner"
+	claimedTask, claimed, err := model.ClaimSystemTask(
+		systemTask.ID,
+		model.SystemTaskTypeTaskDataCleanup,
+		runnerID,
+		common.GetTimestamp()+60,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	taskDataCleanupHandler{}.Run(context.Background(), claimedTask, runnerID)
+
+	var stored model.Task
+	require.NoError(t, model.DB.First(&stored, imageTask.ID).Error)
+	assert.Empty(t, stored.Data)
+	assert.Equal(t, 17, stored.UserId)
+	assert.Equal(t, 29, stored.ChannelId)
+	assert.Equal(t, "metadata remains", stored.FailReason)
+
+	finished, err := model.GetSystemTaskByTaskID(systemTask.TaskID)
+	require.NoError(t, err)
+	require.NotNil(t, finished)
+	assert.Equal(t, model.SystemTaskStatusSucceeded, finished.Status)
+	assert.Contains(t, finished.Result, `"cleared_count":1`)
+}
+
 func TestSystemTaskClaimPassDispatchesByType(t *testing.T) {
 	truncate(t)
 

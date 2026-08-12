@@ -25,6 +25,9 @@ const (
 	// pass runs, independent of how often the runner wakes to claim tasks.
 	systemTaskSchedulerInterval = 15 * time.Second
 	systemTaskStaleLockInterval = 30 * time.Second
+	taskDataRetention           = 3 * time.Hour
+	taskDataCleanupInterval     = 3 * time.Hour
+	taskDataCleanupBatchSize    = 50
 )
 
 // SystemTaskHandler executes a claimed task of a specific type. Run owns the
@@ -83,8 +86,38 @@ func (logCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runner
 	runLogCleanupTask(ctx, task, runnerID)
 }
 
+type taskDataCleanupHandler struct{}
+
+func (taskDataCleanupHandler) Type() string            { return model.SystemTaskTypeTaskDataCleanup }
+func (taskDataCleanupHandler) Enabled() bool           { return true }
+func (taskDataCleanupHandler) Interval() time.Duration { return taskDataCleanupInterval }
+func (taskDataCleanupHandler) NewPayload() any         { return nil }
+
+func (taskDataCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	cutoff := time.Now().Add(-taskDataRetention).Unix()
+	var cleared int64
+	for {
+		batchCleared, err := model.ClearExpiredTerminalTaskDataBatch(ctx, cutoff, taskDataCleanupBatchSize)
+		if err != nil {
+			failSystemTask(task, runnerID, err)
+			return
+		}
+		cleared += batchCleared
+		if batchCleared < taskDataCleanupBatchSize {
+			break
+		}
+	}
+	result := struct {
+		ClearedCount int64 `json:"cleared_count"`
+	}{ClearedCount: cleared}
+	if err := model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, result, ""); err != nil {
+		logSystemTaskLockError(ctx, task, err)
+	}
+}
+
 func init() {
 	RegisterSystemTaskHandler(logCleanupHandler{})
+	RegisterSystemTaskHandler(taskDataCleanupHandler{})
 }
 
 type LogCleanupPayload struct {
