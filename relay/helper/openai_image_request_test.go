@@ -123,6 +123,11 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 			body:  `{"model":"gpt-image-1","prompt":"a cat"}`,
 			wantN: 1,
 		},
+		{
+			name:    "invalid size type is rejected as a client validation error",
+			body:    `{"model":"gpt-image-1","prompt":"a cat","size":true}`,
+			wantErr: "size must be a string, got boolean",
+		},
 	}
 
 	for _, tt := range tests {
