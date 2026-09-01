@@ -132,6 +132,15 @@ func (a *TaskAdaptor) buildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err := common.Unmarshal(body, &fields); err != nil {
 		return nil, fmt.Errorf("decode image request: %w", err)
 	}
+	if value, ok := fields["size"]; ok {
+		if common.GetJsonType(value) != "string" {
+			autoSize, marshalErr := common.Marshal("auto")
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			fields["size"] = autoSize
+		}
+	}
 	model, err := resolveModel(info, fields)
 	if err != nil {
 		return nil, err

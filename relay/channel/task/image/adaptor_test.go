@@ -85,6 +85,53 @@ func TestBuildRequestBodyNormalizesAsyncImageRequest(t *testing.T) {
 	assert.Equal(t, []any{"https://example.com/reference.png"}, got["images"])
 }
 
+func TestBuildRequestBodyNormalizesInvalidSizeTypeToAuto(t *testing.T) {
+	c := newJSONContext(t, `{
+		"model": "gpt-image-2-4k-async",
+		"prompt": "city at night",
+		"size": true
+	}`)
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+		OriginModelName: testModel,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: testModel,
+		},
+	}
+	adaptor := &TaskAdaptor{}
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+
+	reader, err := adaptor.BuildRequestBody(c, info)
+	require.NoError(t, err)
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, common.Unmarshal(body, &got))
+	assert.Equal(t, "auto", got["size"])
+}
+
+func TestBuildRequestBodyPreservesStringSize(t *testing.T) {
+	c := newJSONContext(t, `{
+		"model": "gpt-image-2-4k-async",
+		"prompt": "city at night",
+		"size": "1024×1024"
+	}`)
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+		OriginModelName: testModel,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: testModel,
+		},
+	}
+	reader, err := (&TaskAdaptor{}).BuildRequestBody(c, info)
+	require.NoError(t, err)
+	body, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, common.Unmarshal(body, &got))
+	assert.Equal(t, "1024×1024", got["size"])
+}
+
 func TestPrepareLocalTaskUsesSynchronousUpstreamMode(t *testing.T) {
 	useTestImageQueue(t)
 	c := newJSONContext(t, `{

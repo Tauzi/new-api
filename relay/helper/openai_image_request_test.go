@@ -88,10 +88,11 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 	boundErr := fmt.Sprintf("n must be an integer between 1 and %d", dto.MaxImageN)
 
 	tests := []struct {
-		name    string
-		body    string
-		wantErr string
-		wantN   uint
+		name     string
+		body     string
+		wantErr  string
+		wantN    uint
+		wantSize string
 	}{
 		{
 			name:    "overflowed uint64 n is rejected",
@@ -109,6 +110,12 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 			wantN: dto.MaxImageN,
 		},
 		{
+			name:     "valid size remains unchanged",
+			body:     `{"model":"gpt-image-1","prompt":"a cat","size":"2048x2048"}`,
+			wantN:    1,
+			wantSize: "2048x2048",
+		},
+		{
 			name:  "explicit n is accepted",
 			body:  `{"model":"gpt-image-1","prompt":"a cat","n":3}`,
 			wantN: 3,
@@ -124,9 +131,10 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 			wantN: 1,
 		},
 		{
-			name:    "invalid size type is rejected as a client validation error",
-			body:    `{"model":"gpt-image-1","prompt":"a cat","size":true}`,
-			wantErr: "size must be a string, got boolean",
+			name:     "invalid size type falls back to auto",
+			body:     `{"model":"gpt-image-1","prompt":"a cat","size":true}`,
+			wantN:    1,
+			wantSize: "auto",
 		},
 	}
 
@@ -142,6 +150,9 @@ func TestGetAndValidOpenAIImageRequestNBounds(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, req.N)
 			require.Equal(t, tt.wantN, *req.N)
+			if tt.wantSize != "" {
+				require.Equal(t, tt.wantSize, req.Size)
+			}
 			require.Equal(t, float64(tt.wantN), req.GetTokenCountMeta().BillingRatios["n"])
 		})
 	}

@@ -249,14 +249,6 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 			return nil, errors.New("model is required")
 		}
 
-		if invalidType := imageRequest.InvalidFieldType("size"); invalidType != "" {
-			return nil, fmt.Errorf("size must be a string, got %s", invalidType)
-		}
-
-		if strings.Contains(imageRequest.Size, "×") {
-			return nil, errors.New("size an unexpected error occurred in the parameter, please use 'x' instead of the multiplication sign '×'")
-		}
-
 		if imageRequest.N != nil && *imageRequest.N > dto.MaxImageN {
 			return nil, fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
 		}

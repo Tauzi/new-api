@@ -42,11 +42,6 @@ type ImageRequest struct {
 	Image            json.RawMessage `json:"image,omitempty"`
 	// 用匿名参数接收额外参数
 	Extra map[string]json.RawMessage `json:"-"`
-
-	// invalidFieldTypes records fields whose JSON value had an incompatible
-	// type. Image requests keep parsing far enough for validation to return a
-	// client error instead of turning a malformed optional field into a 500.
-	invalidFieldTypes map[string]string
 }
 
 func (i *ImageRequest) UnmarshalJSON(data []byte) error {
@@ -59,16 +54,19 @@ func (i *ImageRequest) UnmarshalJSON(data []byte) error {
 	// 用 struct tag 获取所有已定义字段名
 	knownFields := GetJSONFieldNames(reflect.TypeOf(*i))
 
-	// Keep optional image fields type-tolerant during decoding. Validation will
-	// reject an incompatible value with a 400 response; decoding must not make
-	// a client typo look like an internal server failure.
-	invalidFieldTypes := make(map[string]string)
+	// Keep the optional size field type-tolerant during decoding. A malformed
+	// JSON value is normalized to the provider-neutral "auto" value instead of
+	// making the whole request fail during Go string unmarshalling.
+	autoSize, err := common.Marshal("auto")
+	if err != nil {
+		return err
+	}
 	knownPayload := make(map[string]json.RawMessage, len(rawMap))
 	for key, value := range rawMap {
 		if key == "size" {
 			jsonType := common.GetJsonType(value)
-			if jsonType != "string" && jsonType != "null" {
-				invalidFieldTypes[key] = jsonType
+			if jsonType != "string" {
+				knownPayload[key] = autoSize
 				continue
 			}
 		}
@@ -86,9 +84,6 @@ func (i *ImageRequest) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*i = ImageRequest(known)
-	if len(invalidFieldTypes) > 0 {
-		i.invalidFieldTypes = invalidFieldTypes
-	}
 
 	// 提取多余字段
 	i.Extra = make(map[string]json.RawMessage)
@@ -98,16 +93,6 @@ func (i *ImageRequest) UnmarshalJSON(data []byte) error {
 		}
 	}
 	return nil
-}
-
-// InvalidFieldType returns the JSON type captured for a field whose value
-// could not be represented by the request DTO. It is intentionally read-only
-// and used by request validation to produce a client-facing 400.
-func (i *ImageRequest) InvalidFieldType(field string) string {
-	if i == nil || i.invalidFieldTypes == nil {
-		return ""
-	}
-	return i.invalidFieldTypes[field]
 }
 
 // 序列化时需要重新把字段平铺
